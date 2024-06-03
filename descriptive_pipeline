@@ -1,0 +1,497 @@
+import pandas as pd
+import numpy as np
+import random
+
+class descriptive_pipeline():
+    
+    def __init__(self, df_claim, df_policy, df_web_scraped, df_provider_information, df_agent_info, df_client_historical_claims):
+        # Input files
+        self.df_claim = df_claim
+        self.df_policy = df_policy
+        self.df_web_scraped = df_web_scraped
+        self.df_provider_information = df_provider_information
+        self.df_agent_info = df_agent_info
+        self.df_client_historical_claims = df_client_historical_claims
+        
+        # Intermediate cleaned files
+        self.df_claim_cleaned = pd.DataFrame()
+        self.df_policy_cleaned = pd.DataFrame()
+        
+        # Merged files
+        self.df_claim_policy_webscraped = pd.DataFrame()
+        self.df_claim_policy_webscraped_cleaned = pd.DataFrame()
+        
+        # Output files
+        self.df_descriptive_granular = pd.DataFrame()
+        self.df_descriptive_aggregated = pd.DataFrame()
+        
+        # Columns to filter
+
+        self.common_columns_between_claim_and_policy = ['agency_cd', 'agent_cd', 'agent_province_code', 'agent_region_code', 'cvg_attain_age',
+                                    'duration', 'hsm_grouping', 'ins_province_code', 'ins_region_code', 'occ_code', 'sex_code']
+        
+        self.output_granular_columns_to_keep = ['claim_no', 'hospitalization_date', 'discharge_date', 'occurrence', 
+                                   'doctor_code', 'hospital_code', 'receive_date', 'policy_no', 'coverage_no_rider_cd' , 
+                                   'benefit_code_desc_en', 'eligibleamt', 'ins_region_name', 'diagnosis_category_1', 
+                                   'diagnosis_desc_1', 'diagnosis_category_2', 'diagnosis_desc_2', 'diagnosis_category_3', 
+                                   'diagnosis_desc_3', 'procedure_desc_1', 'procedure_desc_2', 'procedure_desc_3']
+         
+    # Methods to clean
+    
+    def clean_column_names(self, columns):
+        return [i.lower().replace(" ", "_").replace("?", "") for i in columns]
+    
+    def clean_claims(self):
+        # Filter required columns
+        df_claim_filtered = self.df_claim[[col for col in self.df_claim.columns if 'unnamed' not in col.lower()]]
+        
+        # Clean column names
+        df_claim_filtered.columns = self.clean_column_names(df_claim_filtered.columns)
+        
+        # Ensure dtype
+        df_claim_filtered['policyno'] = df_claim_filtered['policyno'].astype(str)
+        df_claim_filtered['rider_cd'] = df_claim_filtered['rider_cd'].astype(str)
+        df_claim_filtered['client_id'] = df_claim_filtered['client_id'].astype(str)
+        
+        for date_col in ['hospitalization_date', 'discharge_date', 'receive_date']:
+            df_claim_filtered[date_col] = pd.to_datetime(df_claim_filtered[date_col], format="%m/%d/%Y", errors='coerce')
+        
+        df_claim_filtered = df_claim_filtered.replace("nan", np.nan)
+        
+        # Filling some columns with NA values with 0
+        for col in ['eligibleamt', 'prst_amt_bill', 'prst_amt_paymentdtl']:
+            df_claim_filtered[col] = df_claim_filtered[col].fillna(0)
+        
+        # Removing rows
+        df_claim_filtered = df_claim_filtered[df_claim_filtered['hospitalization_date'].notnull()]
+        df_claim_filtered = df_claim_filtered[df_claim_filtered['eligibleamt'] != 0]
+        df_claim_filtered = df_claim_filtered[(df_claim_filtered['prst_amt_bill'] != 0) | (df_claim_filtered['prst_amt_paymentdtl'] != 0)]
+        
+        # Cleaning values in rows
+        df_claim_filtered['rider_cd'] = df_claim_filtered['rider_cd'].apply(lambda x: x.strip("0").strip(".") if type(x) == str else x)
+        
+        # Renaming columns
+        df_claim_filtered = df_claim_filtered.rename(columns={'policyno': 'policy_no', 'rider_cd': 'coverage_no_rider_cd'})
+
+        # Final sort
+        df_claim_filtered = df_claim_filtered.sort_values(by=['claim_no', 'hospitalization_date', 'occurrence', 'benefit_code', 'policy_no', 'coverage_no_rider_cd'])
+
+        # Return cleaned claim data
+        self.df_claim_cleaned = df_claim_filtered
+
+    
+    def clean_policy(self):
+        # Remove junk columns
+        df_policy_filtered = self.df_policy[[col for col in self.df_policy.columns if 'unnamed' not in col.lower()]]
+        
+        # Clean column names
+        df_policy_filtered.columns = self.clean_column_names(df_policy_filtered.columns)
+        
+        # Ensure dtype
+        df_policy_filtered['policy_no'] = df_policy_filtered['policy_no'].astype(str)
+        df_policy_filtered['client_id'] = df_policy_filtered['client_id'].astype(str)
+        df_policy_filtered['coverage_no'] = df_policy_filtered['coverage_no'].astype(str)
+        
+        df_policy_filtered = df_policy_filtered.replace("nan", np.nan)
+        
+        # Remove unnecessary rows
+        df_policy_filtered=df_policy_filtered[(df_policy_filtered['policy_no'].isin(self.df_claim_cleaned['policy_no'].unique())) & 
+                                              (df_policy_filtered['client_id'].isin(self.df_claim_cleaned['client_id'].unique())) &
+                                              (df_policy_filtered['coverage_no'].isin(self.df_claim_cleaned['coverage_no_rider_cd'].unique()))]
+
+        df_policy_filtered.drop_duplicates(inplace=True)
+        
+        # Creating and renaming columns
+        df_policy_filtered = df_policy_filtered.reset_index(drop=True)
+        df_policy_filtered = df_policy_filtered.rename(columns = {'coverage_no': 'coverage_no_rider_cd'})
+        
+        # Return cleaned policy data
+        self.df_policy_cleaned = df_policy_filtered
+        
+    def merge_and_clean_claim_policy_webscraped(self):
+        # Merging claims data with hospital provider information
+        df_claim_cleaned = self.df_claim_cleaned.copy()
+        df_provider_information = self.df_provider_information.copy()
+        
+        df_provider_information.columns = self.clean_column_names(df_provider_information.columns)
+        df_provider_information['hospital_code'] = df_provider_information['hospital_code'].astype(str)
+        
+        mask_dict = {'0':'A', '1':'1', '2':'3', '3':'5', '4':'S', '5':'8', '6':'7', '7':'6', '8':'C', '9':'Z'}
+        unmask_dict = {value:key for (key, value) in mask_dict.items()}
+
+        def find_replace(string, dictionary):
+            val = ''
+            for item in string:
+                if item in dictionary.keys():
+                    val += dictionary[item]
+            return val
+
+
+        def unmask(df, col):
+            df[col] = df[col].astype(str)
+            df[col] = df[col].apply(lambda x: find_replace(x, unmask_dict))
+            return df[col]
+        
+        df_claim_cleaned['hospital_code'] = df_claim_cleaned['hospital_code'].apply(lambda x: find_replace(x, unmask_dict))
+        df_claim_cleaned = pd.merge(df_claim_cleaned, df_provider_information, how='left', on=['hospital_code'])
+        
+        rearranged_columns = list(df_claim_cleaned.columns[:2]) + ['hospitaltier', 'locationtype'] + list(df_claim_cleaned.columns[2:-2])
+        df_claim_cleaned = df_claim_cleaned[rearranged_columns]
+        
+        # Merge Claims data with Policy data
+        df_claim_policy = pd.merge(df_claim_cleaned, self.df_policy_cleaned, how='left', on=['policy_no', 'client_id', 'coverage_no_rider_cd', 'cycle_dt'])
+        
+        # Merge Claims_Policy data with Webscrapped data
+        df_claims_policy_webscraped = df_claim_policy.copy()
+        df_web_scraped = self.df_web_scraped.copy()
+        df_web_scraped.columns = self.clean_column_names(df_web_scraped.columns)
+        
+        for diagnosis_no in [1,2,3]:
+            df_claims_policy_webscraped[f"diagnosis_{diagnosis_no}"] = df_claims_policy_webscraped[f"diagnosis_{diagnosis_no}"].astype(str)
+            df_claims_policy_webscraped = pd.merge(df_claims_policy_webscraped, df_web_scraped[['diagnosis_code', 'when_to_worry', 'what_is_treatment', 'source_name']], how='left', left_on=[f"diagnosis_{diagnosis_no}"], right_on=["diagnosis_code"])
+            df_claims_policy_webscraped.rename(columns = {"when_to_worry": f"when_to_worry_{diagnosis_no}", "what_is_treatment": f"what_is_treatment_{diagnosis_no}", "source_name": f"disease_source_{diagnosis_no}"}, inplace=True)
+            df_claims_policy_webscraped.drop(columns=['diagnosis_code'], inplace=True)
+            df_claims_policy_webscraped[f"diagnosis_{diagnosis_no}"] = df_claims_policy_webscraped[f"diagnosis_{diagnosis_no}"].apply(lambda x: np.nan if x == 'nan' else x)
+            
+        # For common rows between Claims and Policy with _x, _y after joining, to combine first taking claims row value if not NAN
+        for col in self.common_columns_between_claim_and_policy:
+            df_claims_policy_webscraped[col] = df_claims_policy_webscraped[f"{col}_x"].combine_first(df_claims_policy_webscraped[f"{col}_y"])
+            df_claims_policy_webscraped.drop(columns=[f"{col}_x", f"{col}_y"], inplace=True)
+            
+        self.df_claim_policy_webscraped = df_claims_policy_webscraped
+        
+        # Clean merged data - removing claim rows with missing policy
+        list_of_claim_no_with_missing_policy_info = list(df_claims_policy_webscraped[df_claims_policy_webscraped['lapse_ind'].isnull()]['claim_no'].unique())
+        df_claim_policy_webscraped_cleaned = df_claims_policy_webscraped[~df_claims_policy_webscraped['claim_no'].isin(list_of_claim_no_with_missing_policy_info)].copy()
+        
+        self.df_claim_policy_webscraped_cleaned = df_claim_policy_webscraped_cleaned
+        
+    def process_granular_aggregated_output_files(self):
+        
+        df_claim_policy_webscraped_cleaned = self.df_claim_policy_webscraped_cleaned.copy()
+        
+        #### Process granular ####
+        
+        # Functions
+        
+        def process_df_for_json_output(df):
+            numerical_cols = list(df.dtypes[(df.dtypes == float) | (df.dtypes == int)].index)
+            other_cols = [i for i in df.columns if i not in numerical_cols]
+
+            df[other_cols] = df[other_cols].replace("nan", "NULL").fillna("NULL").astype(str)
+            df[numerical_cols] = df[numerical_cols].fillna(0)
+
+            #replace column names
+            df.columns = [i.replace(" ", "_").lower() for i in df.columns]
+
+            return df
+        
+        # Filter columns and sort
+        df_granular = df_claim_policy_webscraped_cleaned[self.output_granular_columns_to_keep]
+        df_granular = df_granular.sort_values(by=['claim_no', 'hospitalization_date', 'occurrence', 'policy_no', 'coverage_no_rider_cd', 'benefit_code_desc_en'])
+        
+        
+        self.df_descriptive_granular = process_df_for_json_output(df_granular)
+        
+        #### Process aggregated  ####
+        
+        # Functions
+        
+        def get_patient_details(age, sex_code):
+            if sex_code == 'M':
+                sex = 'Male'
+            elif sex_code == 'F':
+                sex = 'Female'
+                
+            try:
+                age = int(age)
+
+                if age <= 1:
+                    details = f"{age} year old {sex}"
+                else:
+                    details = f"{age} years old {sex}"
+            except ValueError:
+                details = f"Unknown age {sex}"
+
+            return details
+        
+        def rename_aggregated_columns(df, aggregated_tag):
+            df_final = df.copy()
+            modified_columns = []
+            for col in df_final.columns:
+                if col != 'claim_no':
+                    modified_columns.append(f"{col}_{aggregated_tag}")
+                else:
+                    modified_columns.append(col)
+
+            df_final.columns = modified_columns
+
+            return df_final
+        
+        def aggregate_unique_diagnosis_of_single_claim(df):
+            final_list = []
+            for i in [1,2,3]:
+                temp_list = list(set(list(zip(list(df['claim_no']), list(df[f"diagnosis_{i}"]), 
+                                              list(df[f"diagnosis_category_{i}"]), list(df[f"diagnosis_desc_{i}"]), 
+                                              list(df[f"when_to_worry_{i}"]), list(df[f"what_is_treatment_{i}"]), list(df[f"disease_source_{i}"])))))
+
+                final_list.extend(temp_list)
+
+            final_list = list(set(final_list))
+            final_list = [i for i in final_list if type(i[3]) == str]
+            final_list = sorted(final_list, key=lambda x: x[3])
+
+            if len(final_list) < 10:
+                extra_tuples_to_add = 10 - len(final_list)
+                while extra_tuples_to_add > 0:
+                    final_list.extend([(df['claim_no'].unique()[0], np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)])
+                    extra_tuples_to_add -= 1
+
+            final_list = final_list[:10]
+
+            return final_list
+        
+        # get first client_id (that is not id:1)
+        df_client_id = pd.DataFrame(df_claim_policy_webscraped_cleaned.groupby('claim_no')['client_id'].apply(lambda x: sorted(list(set(x)), reverse=True)[0])).reset_index()
+        df_agent_cd = pd.DataFrame(df_claim_policy_webscraped_cleaned.groupby('claim_no')['agent_cd'].apply(lambda x: sorted(list(set(x)), reverse=True)[0])).reset_index()
+        
+        df_client_id = pd.merge(df_client_id, self.df_client_historical_claims, how='left', on='client_id')
+        df_agent_cd = pd.merge(df_agent_cd, self.df_agent_info, how='left', on='agent_cd')
+        
+        
+        # Patient Details
+        df_patient_details = df_claim_policy_webscraped_cleaned[['claim_no', 'age', 'sex_code']].copy()
+
+        df_patient_details['patient_details'] = df_patient_details.apply(lambda row: get_patient_details(row['age'], row['sex_code']), axis=1)
+        df_patient_details = df_patient_details.drop_duplicates(subset=['claim_no'])[['claim_no', 'patient_details']]
+
+        # Aggregation columns
+        unique_count_columns = ['policy_no', 'hospitalization_date']
+        min_columns = ['hospitalization_date']
+        max_columns = ['hospitalization_date', 'receive_date']
+
+        sum_columns = ['eligibleamt']
+
+            # unique_count_columns
+        df_unique_count = df_claim_policy_webscraped_cleaned.groupby(['claim_no'])[unique_count_columns].nunique().reset_index()
+        df_unique_count = rename_aggregated_columns(df_unique_count, "uniquecount")
+
+            #sum columns - prst bill amount and eligible amount aggregation
+        df_prst_amt_bill = pd.DataFrame(df_claim_policy_webscraped_cleaned.groupby(['claim_no', 'hospitalization_date', 'occurrence'])['prst_amt_bill'].mean()).reset_index()
+        df_prst_amt_paymentdtl = pd.DataFrame(df_claim_policy_webscraped_cleaned.groupby(['claim_no', 'hospitalization_date', 'occurrence'])['prst_amt_paymentdtl'].sum()).reset_index()
+        df_eligible_amt = pd.DataFrame(df_claim_policy_webscraped_cleaned.groupby(['claim_no', 'hospitalization_date', 'occurrence'])['eligibleamt'].sum()).reset_index()
+
+            
+        df_merged = pd.merge(df_prst_amt_bill, df_prst_amt_paymentdtl, how='left', on=['claim_no', 'hospitalization_date', 'occurrence'])
+        df_merged = pd.merge(df_merged, df_eligible_amt, how='left', on=['claim_no', 'hospitalization_date', 'occurrence'])
+
+            # Rounding of columns (1300.4 vs 1300.39999998)
+        for col in ['prst_amt_bill', 'prst_amt_paymentdtl', 'eligibleamt']:
+            df_merged[col] = df_merged[col].apply(lambda x: round(x, 1))
+
+        df_merged['prst_amt_bill_modified'] = df_merged.apply(lambda row: max(row['prst_amt_bill'], row['prst_amt_paymentdtl']), axis=1)
+
+
+        df_sum = df_merged.groupby(['claim_no'])[['prst_amt_bill_modified', 'eligibleamt']].sum().reset_index()
+
+            #min columns
+        df_min = df_claim_policy_webscraped_cleaned.groupby(['claim_no'])[min_columns].min().reset_index()
+        df_min = rename_aggregated_columns(df_min, "min")
+
+            #max columns
+        df_max = df_claim_policy_webscraped_cleaned.groupby(['claim_no'])[max_columns].max().reset_index()
+        df_max = rename_aggregated_columns(df_max, "max")
+
+        # diagnosis aggregation
+        lst = list(pd.DataFrame(df_claim_policy_webscraped_cleaned.groupby(['claim_no']).apply(lambda df: aggregate_unique_diagnosis_of_single_claim(df))).reset_index()[0])
+        df_diagnosis = pd.DataFrame(np.array([tup for sub_list in lst for tup in sub_list]))
+        df_diagnosis.columns = ['claim_no', 'diagnosis_code', 'diagnosis_category', 'diagnosis_description', 'when_to_worry', 'what_is_treatment', 'diagnosis_information_source']
+        df_diagnosis['index'] = [1,2,3,4,5,6,7,8,9,10] * df_diagnosis['claim_no'].nunique()
+        df_diagnosis_final = pd.pivot(data=df_diagnosis, index='claim_no', columns='index', values=['diagnosis_code', 'diagnosis_category', 'diagnosis_description', 'when_to_worry', 'what_is_treatment', 'diagnosis_information_source']).reset_index()
+        df_diagnosis_final.columns = [f"{i[0]}_{i[1]}" if i[0] != 'claim_no' else i[0] for i in df_diagnosis_final.columns]
+
+        # getting agent data and past claims history - AE/LR currently only in merged claim_policy data from previous project
+
+            #### Place holder - create artificial rows first #####
+#         columns_required_for_agent_data_past_claims_history = ['ae', 'lr', 'agent_size', 'customer_claims_expense_last12m', 'customer_claims_last12m', 'past_claim1', 'past_claim2', 'past_claim3']
+
+#         df_agent_data_past_claim_history = pd.DataFrame()
+#         df_agent_data_past_claim_history['claim_no'] = df_claim_policy_webscraped_cleaned['claim_no'].unique()
+#         df_agent_data_past_claim_history['ae'] = ">=140%"
+#         df_agent_data_past_claim_history['lr'] = ">=70%"
+#         df_agent_data_past_claim_history['agent_size'] = "L"
+#         df_agent_data_past_claim_history['customer_claims_expense_last12m'] = 1000
+#         df_agent_data_past_claim_history['customer_claims_last12m'] = 1
+#         df_agent_data_past_claim_history['past_claim1'] = "DD/MM/YYYY - Diagnosis Desc."
+#         df_agent_data_past_claim_history['past_claim2'] = ""
+#         df_agent_data_past_claim_history['past_claim3'] = ""
+            #### Place holder - create artificial rows first #####
+
+        ## Excessive LOS (Max. LOS vs 75th percentile LOS) and Excessive Charges benchmark (Max. Hospital Services Charges vs. 75th percentile HSC)
+        columns_required_for_excessive_los_charges = ['los_max', 'hospital_service_charges_sum', 'los_75p', 'hospital_service_charges_75p']
+        df_excessive_los = pd.DataFrame(df_claim_policy_webscraped_cleaned.groupby(['claim_no']).apply(lambda df: max(df['discharge_date'] - df['hospitalization_date']).days)).reset_index()
+        df_excessive_los.rename(columns={0: 'los_max'}, inplace=True)
+        
+#         df_excessive_charges = pd.DataFrame(df_claim_policy_webscraped_cleaned.groupby(['claim_no'])['prst_amt_bill'].sum()).reset_index().rename(columns={'prst_amt_bill': 'hospital_service_charges_sum'})
+        df_excessive_charges = df_sum[['claim_no', 'prst_amt_bill_modified']].copy().rename(columns={'prst_amt_bill_modified': 'hospital_service_charges_sum'})
+        
+        df_excessive_los_charges = pd.merge(df_excessive_los, df_excessive_charges, how='outer', on=['claim_no'])
+        df_excessive_los_charges['los_75p'] = 3
+        df_excessive_los_charges['hospital_service_charges_75p'] = 39183
+        
+
+        # Merging to base DF
+        df_base = pd.DataFrame(df_claim_policy_webscraped_cleaned['claim_no'].unique(), columns=['claim_no'])
+
+        for df in [df_client_id, df_agent_cd, df_patient_details, df_unique_count, df_sum, df_min, df_max, df_diagnosis_final, df_excessive_los_charges]:
+            df_base = pd.merge(df_base, df, how='left', on=['claim_no'])
+            
+        # Processing claims_history_info and drop columns
+        
+        def filter_for_claims_history(row):
+    
+            claims_history = np.array(row['claims_history'])
+            receive_date_max = row['receive_date_max']
+
+            claims_history_filtered = claims_history[np.where((claims_history[:, 0] < pd.to_datetime(receive_date_max)) & (claims_history[:, 0] >= (pd.to_datetime(receive_date_max) - pd.Timedelta(days=365))))]
+
+            if len(claims_history_filtered) == 0:
+                return 0, 0, np.nan, np.nan, np.nan
+
+            else:
+
+                claims_expense_last12m = sum(claims_history_filtered[:, 1])
+                claims_last12m = len(claims_history_filtered)
+                past_claims = list(claims_history_filtered[:, 2])
+                past_claims = past_claims[:3][::-1]
+
+                length_past_claims = len(past_claims)
+                while length_past_claims < 3:
+                    past_claims.append(np.nan)
+                    length_past_claims = len(past_claims)
+
+                return claims_expense_last12m, claims_last12m, past_claims[0], past_claims[1], past_claims[2]
+        
+        processed_series = df_base.apply(lambda row: filter_for_claims_history(row), axis=1)
+        
+        df_base['customer_claims_expense_last12m'] = processed_series.apply(lambda x: x[0])
+        df_base['customer_claims_last12m'] = processed_series.apply(lambda x: x[1])
+        df_base['past_claim1'] = processed_series.apply(lambda x: x[2]).astype(str)
+        df_base['past_claim2'] = processed_series.apply(lambda x: x[3]).astype(str)
+        df_base['past_claim3'] = processed_series.apply(lambda x: x[4]).astype(str)
+
+        dashboard_columns = ['claim_no',
+                             'client_id',
+                             'agent_cd',
+                             'receive_date_max',
+                             'patient_details',
+                             'prst_amt_bill_modified',
+                             'eligibleamt',
+                             'policy_no_uniquecount',
+                             'hospitalization_date_uniquecount',
+                             'hospitalization_date_min',
+                             'hospitalization_date_max',
+                             
+                             'customer_claims_last12m',
+                             'customer_claims_expense_last12m',
+                             'ae',
+                             'lr',
+                             'agent_size',
+                             
+                             'past_claim1',
+                             'past_claim2',
+                             'past_claim3',
+                             
+                             'diagnosis_code_1',
+                             'diagnosis_code_2',
+                             'diagnosis_code_3',
+                             'diagnosis_code_4',
+                             'diagnosis_code_5',
+                             'diagnosis_code_6',
+                             'diagnosis_code_7',
+                             'diagnosis_code_8',
+                             'diagnosis_code_9',
+                             'diagnosis_code_10',
+                             'diagnosis_category_1',
+                             'diagnosis_category_2',
+                             'diagnosis_category_3',
+                             'diagnosis_category_4',
+                             'diagnosis_category_5',
+                             'diagnosis_category_6',
+                             'diagnosis_category_7',
+                             'diagnosis_category_8',
+                             'diagnosis_category_9',
+                             'diagnosis_category_10',
+                             'diagnosis_description_1',
+                             'diagnosis_description_2',
+                             'diagnosis_description_3',
+                             'diagnosis_description_4',
+                             'diagnosis_description_5',
+                             'diagnosis_description_6',
+                             'diagnosis_description_7',
+                             'diagnosis_description_8',
+                             'diagnosis_description_9',
+                             'diagnosis_description_10',
+                             'when_to_worry_1',
+                             'when_to_worry_2',
+                             'when_to_worry_3',
+                             'when_to_worry_4',
+                             'when_to_worry_5',
+                             'when_to_worry_6',
+                             'when_to_worry_7',
+                             'when_to_worry_8',
+                             'when_to_worry_9',
+                             'when_to_worry_10',
+                             'what_is_treatment_1',
+                             'what_is_treatment_2',
+                             'what_is_treatment_3',
+                             'what_is_treatment_4',
+                             'what_is_treatment_5',
+                             'what_is_treatment_6',
+                             'what_is_treatment_7',
+                             'what_is_treatment_8',
+                             'what_is_treatment_9',
+                             'what_is_treatment_10',
+                             'diagnosis_information_source_1',
+                             'diagnosis_information_source_2',
+                             'diagnosis_information_source_3',
+                             'diagnosis_information_source_4',
+                             'diagnosis_information_source_5',
+                             'diagnosis_information_source_6',
+                             'diagnosis_information_source_7',
+                             'diagnosis_information_source_8',
+                             'diagnosis_information_source_9',
+                             'diagnosis_information_source_10',
+                             
+                             'los_max',
+                             'hospital_service_charges_sum',
+                             'los_75p',
+                             'hospital_service_charges_75p']
+
+        df_aggregated = process_df_for_json_output(df_base[dashboard_columns])
+        self.df_descriptive_aggregated = df_aggregated
+        
+    def e2e_cleaning_and_merging(self, dask_source=False):
+        
+        print("Cleaning Claims Data...")
+        self.clean_claims()
+        
+        print("Cleaning Policy Data...")
+        self.clean_policy()
+        
+        print("Merging...")
+        self.merge_and_clean_claim_policy_webscraped()
+        
+        print("Processing output files...")
+        self.process_granular_aggregated_output_files()
+        
+        print("Complete.")
+        
+    # Get methods
+    
+    def get_merged_claim_policy_webscraped(self, clean=True):
+        
+        if clean == True:
+            return self.df_claim_policy_webscraped_cleaned
+        else:
+            return self.df_claim_policy_webscraped
