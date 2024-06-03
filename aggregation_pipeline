@@ -1,0 +1,804 @@
+import pandas as pd
+import numpy as np
+import json
+from dateutil import relativedelta
+
+class aggregation_pipeline():
+    
+    def __init__(self, df_claim_policy_webscraped_cleaned):
+        self.df_claim_policy_webscraped_cleaned= df_claim_policy_webscraped_cleaned
+        
+        #define processing data
+        self.data_process=pd.DataFrame()
+        #define subsets in different step
+        self.sub_benefit_pivot=pd.DataFrame()
+        self.sub_df_max=pd.DataFrame()
+        self.sub_df_count=pd.DataFrame()
+        self.sub_df_dummy=pd.DataFrame()
+        self.sub_df_sum_1=pd.DataFrame()
+        self.sub_df_sum_2=pd.DataFrame()
+        self.sub_df_mean=pd.DataFrame()
+        self.sub_df_bin_dummy=pd.DataFrame()
+        
+        #define output file
+        self.df_aggregated=pd.DataFrame()
+        
+    def variable_derivation(self):
+        data_process=self.df_claim_policy_webscraped_cleaned.copy()
+        
+        #Derive los and early_claim
+        def time_delta(x,y):
+            if x == 'NULL':
+                return (np.nan, np.nan, np.nan)
+            else:
+                return (relativedelta.relativedelta(x,y).years, relativedelta.relativedelta(x,y).months, relativedelta.relativedelta(x,y).days)
+
+        data_process['hospitalization_date']  = pd.to_datetime(data_process['hospitalization_date'])
+        data_process['effective_date']        = pd.to_datetime(data_process['effective_date'])
+        data_process['discharge_date']        = pd.to_datetime(data_process['discharge_date'])
+
+        data_process['los'] = abs(data_process['discharge_date'] - data_process['hospitalization_date']).dt.days
+
+        data_process['hospitalization_date']  = data_process['hospitalization_date'].fillna('NULL')
+        data_process['effective_date']  = data_process['effective_date'].fillna(data_process['hospitalization_date'])
+
+        sub_date=data_process[['claim_no', 'hospitalization_date', 'effective_date', 'discharge_date']]
+        sub_date.drop_duplicates(inplace=True)
+        sub_date=sub_date.reset_index(drop=True)
+
+        sub_date['diff_year_hospitalization_effective_date']      = sub_date.apply(lambda x: time_delta(x['hospitalization_date'], x['effective_date'])[0], axis=1)
+        sub_date['diff_month_hospitalization_effective_date']     = sub_date.apply(lambda x: time_delta(x['hospitalization_date'], x['effective_date'])[1], axis=1)
+        sub_date['diff_days_hospitalization_effective_date']      = sub_date.apply(lambda x: time_delta(x['hospitalization_date'], x['effective_date'])[2], axis=1)
+
+        sub_date['early_claim'] = np.where(((sub_date['diff_year_hospitalization_effective_date']==0) & (sub_date['diff_month_hospitalization_effective_date']<6)) | \
+                                                 ((sub_date['diff_year_hospitalization_effective_date']==0) & (sub_date['diff_month_hospitalization_effective_date']==6) & (sub_date['diff_days_hospitalization_effective_date']==0)), 1, 0)
+
+        data_process=pd.merge(data_process, sub_date, on=['claim_no', 'hospitalization_date', 'effective_date', 'discharge_date'], how='left')
+        
+        #Dervie Diagnosis related info
+        critical_illnesses = \
+        ['alzheimer’s disease / severe dementia',
+         'angioplasty & other invasive treatment for coronary artery',
+         'apallic syndrome',
+         'aplastic anaemia',
+         'bacterial meningitis',
+         'benign brain tumour',
+         'blindness (loss of sight)',
+         'coma',
+         'coronary artery by-pass surgery',
+         'creutzfeld-jacob disease',
+         'deafness (loss of hearing)',
+         'elephantiasis',
+         'end stage liver failure',
+         'end stage lung disease',
+         'fulminant hepatitis',
+         'heart attack of specified severity',
+         'heart valve surgery',
+         'hiv due to blood transfusion and occupationally acquired hiv',
+         'kidney failure',
+         'loss of independent existence',
+         'loss of speech',
+         'major burns',
+         'major cancers',
+         'major head trauma',
+         'major organ / bone marrow transplantation',
+         'medullary cystic disease',
+         'motor neurone disease',
+         'multiple sclerosis',
+         'muscular dystrophy',
+         'necrotising fasciitis',
+         'other serious coronary artery disease',
+         'paralysis (loss of use of limbs)',
+         'parkinson’s disease',
+         'poliomyelitis',
+         'primary pulmonary hypertension',
+         'progressive scleroderma',
+         'progressive supranuclear palsy',
+         'severe myasthenia gravis',
+         'stroke',
+         'surgery to aorta',
+         'systemic lupus erythematosus with lupus nephritis',
+         'terminal illness',
+         'viral encephalitis']
+        cols_acute_chronic = ['diagnosis_desc_1',
+         'diagnosis_desc_2',
+         'diagnosis_desc_3',
+         'illness_unique_desc']
+
+
+        for col in cols_acute_chronic:
+            data_process[col] = data_process[col].fillna('null')
+            data_process[col] = data_process[col].str.lower()
+
+
+        data_process['acute']     = np.where((data_process['diagnosis_desc_1'].str.contains('acute')) | \
+                                           (data_process['diagnosis_desc_2'].str.contains('acute')) | \
+                                           (data_process['diagnosis_desc_3'].str.contains('acute')) | \
+                                           (data_process['illness_unique_desc'].str.contains('acute')), 1, 0)
+
+        data_process['chronic']   = np.where((data_process['diagnosis_desc_1'].str.contains('chronic')) | \
+                                           (data_process['diagnosis_desc_2'].str.contains('chronic')) | \
+                                           (data_process['diagnosis_desc_3'].str.contains('chronic')) | \
+                                           (data_process['illness_unique_desc'].str.contains('chronic')), 1, 0)
+
+        data_process['ind_acc']   = np.where((data_process['diagnosis_desc_1'].str.contains('accident')) | \
+                                           (data_process['diagnosis_desc_2'].str.contains('accident')) | \
+                                           (data_process['diagnosis_desc_3'].str.contains('accident')) | \
+                                           (data_process['illness_unique_desc'].str.contains('accident')), 1, 0)
+            
+        data_process['mult_diagnosis']    = np.where(np.where(data_process['diagnosis_desc_1']=='null', 0, 1) + \
+                                                   np.where(data_process['diagnosis_desc_2']=='null', 0, 1) + \
+                                                   np.where(data_process['diagnosis_desc_3']=='null', 0, 1) >= 2, 1, 0)
+
+        self.data_process=data_process
+        
+    def Benefit_w_Eligibility(self):
+        data_process=self.data_process.copy()
+        
+        with open('deployment_preprocfiles/mapping_json/benefit_code.json') as json_file:
+            benefit_code_zip=json.load(json_file)
+
+        data_process['benefit_code_desc_en']=data_process['benefit_code_desc_en'].str.lower()
+        sub_benefit= data_process[['claim_no', 'benefit_code_desc_en', 'eligibleamt']]   
+        sub_benefit['eligibleamt']=sub_benefit['eligibleamt'].fillna(0)
+        sub_benefit['benefit_shc']=sub_benefit['benefit_code_desc_en'].map(benefit_code_zip)
+        
+        sub_benefit['benefit_shc']=sub_benefit['benefit_shc'].fillna('Others')
+        
+        sub_benefit= sub_benefit.groupby(by=['claim_no','benefit_shc'])['eligibleamt'].sum()
+        sub_benefit=sub_benefit.reset_index()
+        
+        sub_benefit_pivot=sub_benefit.pivot(index=['claim_no'], columns='benefit_shc', values='eligibleamt')
+        sub_benefit_pivot=pd.DataFrame(sub_benefit_pivot.to_records())
+        for col in sub_benefit_pivot.columns:
+            if col in ['claim_no']:
+                next
+            else:
+                sub_benefit_pivot[col]=sub_benefit_pivot[col].fillna(0)
+                sub_benefit_pivot = sub_benefit_pivot.rename(columns={col: 'eligibility_' + col })
+
+        sub_benefit_pivot=sub_benefit_pivot.reset_index(drop=True)
+        
+        self.sub_benefit_pivot=sub_benefit_pivot
+        
+    
+    def agg_max(self): 
+        data_process=self.data_process.copy()    
+        col_list_max=['chronic',
+         'early_claim',
+         'ind_acc',
+         'mult_diagnosis',
+         'nb_ind',
+         'lapse_ind',
+         'if_ind']
+        sub_df_max=pd.DataFrame()
+        sub_df_max['claim_no']=data_process.loc[:,'claim_no'].unique()
+        for col in col_list_max:
+            df=data_process[['claim_no',col]]
+            df[col]=df[col].fillna(0)
+            df[col]=df[col].astype(float)
+            df=df.groupby(by=['claim_no'])[col].max()
+            df=df.reset_index(name=col)
+            sub_df_max=pd.merge(sub_df_max,df,on=['claim_no'],how='left')
+        sub_df_max = sub_df_max.reset_index(drop=True) 
+        
+        self.sub_df_max=sub_df_max
+    
+    def agg_count(self):
+        data_process=self.data_process.copy()
+        col_list_count=['client_id', 'plan_id', 'policy_no']
+        sub_df_count=pd.DataFrame()
+        sub_df_count['claim_no']=data_process['claim_no'].unique()
+        for col in col_list_count:
+            df=data_process[['claim_no',col]]
+            df=df.dropna(subset=[col])
+            df.drop_duplicates(inplace=True)
+            df=df.groupby(by=['claim_no'])[col].count()
+            df=df.reset_index(name=col)
+            df=df.rename(columns={col: col + '_count'})    
+            sub_df_count=pd.merge(sub_df_count,df,on=['claim_no'],how='left')
+        sub_df_count = sub_df_count.reset_index(drop=True)
+        
+        self.sub_df_count=sub_df_count
+        
+    def agg_dummy(self):
+        data_process=self.data_process.copy()
+        col_list_dummy=['ins_region_code',
+         'sex_code',
+         'channel',
+         'flag_type',
+         'businessline',
+         'claim_system',
+         'agent_region_code',
+         'hospitaltier',
+         'type_claim',
+         'flag_ppp',
+         'treatmenttype',
+         'mode_premium',
+         'cvg_cstat_cd',
+         'substandard_1',
+         'prev_cvg_cstat_cd',
+         'vip_ind',
+         'occ_class']
+
+        sub_df_dummy=pd.DataFrame()
+        sub_df_dummy['claim_no']=data_process['claim_no'].unique()
+        for col in col_list_dummy:
+            df=data_process[['claim_no',col]]
+            df=df.dropna(subset=[col])
+            df=df.drop_duplicates()
+            df[col]=df[col].astype(str)
+            df[col]=df[col].str.strip()
+            df_1=pd.get_dummies(df[col], prefix=col)
+            df=pd.concat((df,df_1),axis=1)
+            df.drop([col],axis=1, inplace=True)
+            df=df.groupby(by=['claim_no'])[df_1.columns].max()
+            df=df.reset_index()
+            sub_df_dummy=pd.merge(sub_df_dummy,df,on=['claim_no'],how='left')  
+        sub_df_dummy=sub_df_dummy.reset_index(drop=True)
+        
+        self.sub_df_dummy=sub_df_dummy
+        
+    def agg_sum_1(self):
+        data_process=self.data_process.copy()
+        col_list_sum_1=["prst_amt_bill"]
+        sub_df_sum_1=pd.DataFrame()
+        sub_df_sum_1['claim_no']=data_process['claim_no'].unique()
+        for col in col_list_sum_1:
+            df=data_process[['claim_no',col]]
+            df[col]=df[col].fillna(0)
+            df.drop_duplicates(inplace=True)
+            df=df.groupby(by=['claim_no'])[col].sum()
+            df=df.reset_index(name=col)
+            sub_df_sum_1=pd.merge(sub_df_sum_1,df,on=['claim_no'],how='left')
+        sub_df_sum_1 = sub_df_sum_1.reset_index(drop=True)  
+        
+        self.sub_df_sum_1=sub_df_sum_1
+    
+    def agg_sum_2(self):
+        data_process=self.data_process.copy()
+        col_list_sum_2=["eligibleamt"]
+        sub_df_sum_2=pd.DataFrame()
+        sub_df_sum_2['claim_no']=data_process['claim_no'].unique()
+        for col in col_list_sum_2:
+            df=data_process[['claim_no',col]]
+            df[col]=df[col].fillna(0)
+            df=df.groupby(by=['claim_no'])[col].sum()
+            df=df.reset_index(name=col)
+            sub_df_sum_2=pd.merge(sub_df_sum_2,df,on=['claim_no'],how='left')
+        sub_df_sum_2 = sub_df_sum_2.reset_index(drop=True) 
+        
+        self.sub_df_sum_2=sub_df_sum_2
+        
+    def agg_mean(self):
+        data_process=self.data_process.copy()
+        col_list_mean=['rmbs_los',
+         'duration',
+         'duration_yr',
+         'earned_sa',
+         'sum_assured_rb',
+         'cvg_issue_age',
+         'cvg_attain_age',
+         'basic_sum_ass',
+         'ori_basic_sum_ass',
+         'annualize_premium',
+         'e_premium_mth',
+         'e_policy_mth',
+         'exp_clm',
+         'exp_clm_be_2016',
+         'exp_by_age',
+         'procedure_2',
+         'procedure_1',
+         'age']
+
+        sub_df_mean=pd.DataFrame()
+        sub_df_mean['claim_no']=data_process['claim_no'].unique()
+        for col in col_list_mean:
+            df=data_process[['claim_no',col]]
+            df[col]=df[col].fillna(0)
+            df[col]=df[col].astype(float)
+            df.drop_duplicates(inplace=True)
+            df=df.groupby(by=['claim_no'])[col].mean()
+            df=df.reset_index(name=col)
+            sub_df_mean=pd.merge(sub_df_mean,df,on=['claim_no'],how='left')
+        sub_df_mean = sub_df_mean.reset_index(drop=True) 
+        
+        self.sub_df_mean=sub_df_mean
+        
+    def agg_bin_dummy(self):
+        data_process=self.data_process.copy()
+        data_process.loc[data_process['diagnosis_category_1']=='OTHERS','diagnosis_category_1']='Others'
+        data_process.loc[data_process['diagnosis_category_2']=='OTHERS','diagnosis_category_2']='Others'
+        data_process.loc[data_process['diagnosis_category_3']=='OTHERS','diagnosis_category_3']='Others'
+
+        col_list_bin_dummy=['diagnosis_3',
+         'agent_cd',
+         'diagnosis_2',
+         'agent_province_code',
+         'diagnosis_category_2',
+         'ins_zip_cd',
+         'procedure_desc_3',
+         'diagnosis_1',
+         'occ_code',
+         'hsm_grouping',
+         'hospital_code',
+         'diagnosis_category_1',
+         'illness_unique',
+         'planid',
+         'agency_cd',
+         'doctor_code',
+         'plan_short_name',
+         'basic_plan_id',
+         'diagnosis_category_3',
+         'ins_province_code']
+       
+        #load zip file
+        bin_dummy_zip={}
+        for col in col_list_bin_dummy:
+            with open('deployment_preprocfiles/mapping_json/'+ col+'.json') as json_file:
+                bin_dummy_zip[col]=json.load(json_file)
+
+        def col_cast(df,col,col_code_zip):
+        
+            sub_df=df[['claim_no',col]]
+            sub_df=sub_df.dropna(subset=[col])
+            sub_df=sub_df.drop_duplicates()
+            sub_df[col]=sub_df[col].astype(str)
+            sub_df[col]=sub_df[col].str.strip()
+            sub_df[col + '_new']=sub_df[col].map(col_code_zip)
+            sub_df[col + '_new']=sub_df[col + '_new'].fillna('Others')
+            sub_df_1=pd.get_dummies(sub_df[col + '_new'], prefix=col)
+            sub_df=pd.concat((sub_df,sub_df_1),axis=1)
+            sub_df.drop([col,col + '_new'],axis=1, inplace=True)
+            sub_df=sub_df.groupby(by=['claim_no'])[sub_df_1.columns].max()
+            sub_df=sub_df.reset_index()
+            return(sub_df)
+
+        sub_df_bin_dummy=pd.DataFrame()
+        sub_df_bin_dummy['claim_no']=data_process['claim_no'].unique()
+        for col in col_list_bin_dummy:
+            col_zip=bin_dummy_zip[col]
+            df=col_cast(data_process,col,col_zip)
+            sub_df_bin_dummy=pd.merge(sub_df_bin_dummy,df,on=['claim_no'],how='left')
+        
+        self.sub_df_bin_dummy=sub_df_bin_dummy  
+        
+    def merge_out(self):
+    
+        data_process=self.data_process.copy()
+        data_out=pd.DataFrame()
+        data_out['claim_no']=data_process['claim_no'].unique()
+        
+        data_out=pd.merge(data_out,self.sub_benefit_pivot,on=['claim_no'],how='left')
+        data_out=pd.merge(data_out,self.sub_df_max,on=['claim_no'],how='left')
+        data_out=pd.merge(data_out,self.sub_df_count,on=['claim_no'],how='left')
+        data_out=pd.merge(data_out,self.sub_df_dummy,on=['claim_no'],how='left')
+        data_out=pd.merge(data_out,self.sub_df_sum_1,on=['claim_no'],how='left')
+        data_out=pd.merge(data_out,self.sub_df_sum_2,on=['claim_no'],how='left')
+        data_out=pd.merge(data_out,self.sub_df_mean,on=['claim_no'],how='left')
+        data_out=pd.merge(data_out,self.sub_df_bin_dummy,on=['claim_no'],how='left')   
+        
+        total = data_out.isnull().sum().sort_values(ascending=False)
+        percent = (data_out.isnull().sum()/data_out.isnull().count()).sort_values(ascending=False)
+        missing_data = pd.concat([total, percent], axis=1, keys=['Total', 'Percent'])
+        missing_data=missing_data[missing_data['Percent']!=0]
+        data_out[list(missing_data.index)]=data_out[list(missing_data.index)].fillna(0)
+        
+        col_ref=['age',
+         'agency_cd_AAAAAA1361',
+         'agency_cd_AAAAAA1611',
+         'agency_cd_AAAAAA5ZZ7',
+         'agency_cd_AAAAAA81C6',
+         'agency_cd_AAAAAA83AZ',
+         'agency_cd_AAAAAA8661',
+         'agency_cd_AAAAAAA6S5',
+         'agency_cd_AAAAAAC511',
+         'agency_cd_AAAAAAC565',
+         'agency_cd_AAAAAAS5C1',
+         'agency_cd_Others',
+         'agent_cd_AAAA11SA58',
+         'agent_cd_AAAA157583',
+         'agent_cd_AAAA17S775',
+         'agent_cd_AAAA18C861',
+         'agent_cd_AAAA333S73',
+         'agent_cd_AAAA5A7ZS1',
+         'agent_cd_AAAA5Z33SA',
+         'agent_cd_AAAA8353S5',
+         'agent_cd_AAAA83773A',
+         'agent_cd_AAAA871777',
+         'agent_cd_AAAA8A1358',
+         'agent_cd_AAAA8A8783',
+         'agent_cd_AAAAAS616S',
+         'agent_cd_AAAASAAS76',
+         'agent_cd_AAAASC5S1C',
+         'agent_cd_AAAASZAZ7C',
+         'agent_cd_Others',
+         'agent_province_code_001',
+         'agent_province_code_015',
+         'agent_province_code_016',
+         'agent_province_code_019',
+         'agent_province_code_020',
+         'agent_province_code_031',
+         'agent_province_code_032',
+         'agent_province_code_035',
+         'agent_province_code_043',
+         'agent_province_code_047',
+         'agent_province_code_068',
+         'agent_province_code_072',
+         'agent_province_code_073',
+         'agent_province_code_081',
+         'agent_province_code_082',
+         'agent_province_code_087',
+         'agent_province_code_Others',
+         'agent_region_code_1.0',
+         'agent_region_code_2.0',
+         'agent_region_code_3.0',
+         'agent_region_code_4.0',
+         'agent_region_code_5.0',
+         'agent_region_code_6.0',
+         'agent_region_code_7.0',
+         'annualize_premium',
+         'basic_plan_id_10030B',
+         'basic_plan_id_112009',
+         'basic_plan_id_112015',
+         'basic_plan_id_11201A',
+         'basic_plan_id_112A0B',
+         'basic_plan_id_112C0D',
+         'basic_plan_id_22261B',
+         'basic_plan_id_22961B',
+         'basic_plan_id_23801B',
+         'basic_plan_id_Others',
+         'basic_plan_id_U40150',
+         'basic_sum_ass',
+         'businessline_CS',
+         'businessline_OL',
+         'businessline_PA',
+         'channel_1.0',
+         'channel_2.0',
+         'channel_3.0',
+         'channel_4.0',
+         'chronic',
+         'claim_no',
+         'claim_system_CMIC_DATA',
+         'client_id_count',
+         'cvg_attain_age',
+         'cvg_cstat_cd_1',
+         'cvg_cstat_cd_B',
+         'cvg_cstat_cd_D',
+         'cvg_cstat_cd_H',
+         'cvg_cstat_cd_K',
+         'cvg_cstat_cd_V',
+         'cvg_issue_age',
+         'diagnosis_1_A08.0',
+         'diagnosis_1_A09.',
+         'diagnosis_1_A09.0',
+         'diagnosis_1_A09.9',
+         'diagnosis_1_B34.9',
+         'diagnosis_1_H81.3',
+         'diagnosis_1_J02.9',
+         'diagnosis_1_J03.9',
+         'diagnosis_1_J06.9',
+         'diagnosis_1_J10.1',
+         'diagnosis_1_J11.1',
+         'diagnosis_1_J18.9',
+         'diagnosis_1_J20.9',
+         'diagnosis_1_K29.1',
+         'diagnosis_1_K29.7',
+         'diagnosis_1_Others',
+         'diagnosis_1_R50.9',
+         'diagnosis_2_A09.0',
+         'diagnosis_2_E86.',
+         'diagnosis_2_E87.6',
+         'diagnosis_2_I10.',
+         'diagnosis_2_J02.9',
+         'diagnosis_2_J06.9',
+         'diagnosis_2_J20.9',
+         'diagnosis_2_K29.7',
+         'diagnosis_2_K63.5',
+         'diagnosis_2_Others',
+         'diagnosis_2_R42.',
+         'diagnosis_3_D64.9',
+         'diagnosis_3_E14.9',
+         'diagnosis_3_E78.5',
+         'diagnosis_3_E86.',
+         'diagnosis_3_E87.1',
+         'diagnosis_3_E87.6',
+         'diagnosis_3_I10.',
+         'diagnosis_3_K29.7',
+         'diagnosis_3_K63.5',
+         'diagnosis_3_Others',
+         'diagnosis_3_R42.',
+         'diagnosis_category_1_Allergy Disorders',
+         'diagnosis_category_1_Cardiac Disorders',
+         'diagnosis_category_1_Digestive Disorders',
+         'diagnosis_category_1_Ear/Nose/Throat Disorders',
+         'diagnosis_category_1_Endocrine/Metabolic Dx',
+         'diagnosis_category_1_Eye Disorders',
+         'diagnosis_category_1_Gynecologic Disorders',
+         'diagnosis_category_1_Infectious Disease',
+         'diagnosis_category_1_Injury/Poisoning',
+         'diagnosis_category_1_Musculoskeletal Disorders',
+         'diagnosis_category_1_Neurologic Disorders',
+         'diagnosis_category_1_Oncologic Disorders',
+         'diagnosis_category_1_Others',
+         'diagnosis_category_1_Respiratory Disorders',
+         'diagnosis_category_1_Skin Disorders',
+         'diagnosis_category_1_Urologic Disorders',
+         'diagnosis_category_2_Cardiac Disorders',
+         'diagnosis_category_2_Digestive Disorders',
+         'diagnosis_category_2_Ear/Nose/Throat Disorders',
+         'diagnosis_category_2_Endocrine/Metabolic Dx',
+         'diagnosis_category_2_Infectious Disease',
+         'diagnosis_category_2_Injury/Poisoning',
+         'diagnosis_category_2_Musculoskeletal Disorders',
+         'diagnosis_category_2_Neurologic Disorders',
+         'diagnosis_category_2_Others',
+         'diagnosis_category_2_Respiratory Disorders',
+         'diagnosis_category_3_Cardiac Disorders',
+         'diagnosis_category_3_Digestive Disorders',
+         'diagnosis_category_3_Ear/Nose/Throat Disorders',
+         'diagnosis_category_3_Endocrine/Metabolic Dx',
+         'diagnosis_category_3_Hematologic Disorders',
+         'diagnosis_category_3_Infectious Disease',
+         'diagnosis_category_3_Musculoskeletal Disorders',
+         'diagnosis_category_3_Neurologic Disorders',
+         'diagnosis_category_3_Others',
+         'diagnosis_category_3_Respiratory Disorders',
+         'doctor_code_8AAA31A6C1',
+         'doctor_code_8AAA33A555',
+         'doctor_code_8AAA381CZ1',
+         'doctor_code_8AAA3C1SA5',
+         'doctor_code_8AAA3C511C',
+         'doctor_code_8AAA3SAC76',
+         'doctor_code_8AAA55A6C5',
+         'doctor_code_8AAA581337',
+         'doctor_code_8AAA5C37A5',
+         'doctor_code_8AAA5C3SZ5',
+         'doctor_code_8AAA5C8555',
+         'doctor_code_8AAAA11A1S',
+         'doctor_code_8AAAA15AA8',
+         'doctor_code_8AAAA7158C',
+         'doctor_code_8AAAA7188C',
+         'doctor_code_8AAAS1363Z',
+         'doctor_code_Others',
+         'duration',
+         'duration_yr',
+         'e_policy_mth',
+         'e_premium_mth',
+         'early_claim',
+         'earned_sa',
+         'eligibility_Others',
+         'eligibility_ambulance',
+         'eligibility_anaesthesia',
+         'eligibility_callamount',
+         'eligibility_daycase (hosp.ser.500) ',
+         'eligibility_e & o amount',
+         'eligibility_hb-r&b',
+         'eligibility_hbpg home med',
+         'eligibility_home medication',
+         'eligibility_hospital service',
+         'eligibility_icu',
+         'eligibility_opd benefit- hsx',
+         'eligibility_opd follow up',
+         'eligibility_operating theatre fee',
+         'eligibility_r&b',
+         'eligibility_surgicalfee',
+         'eligibility_x-rayamount',
+         'eligibleamt',
+         'exp_by_age',
+         'exp_clm',
+         'exp_clm_be_2016',
+         'flag_ppp_NONPPP',
+         'flag_ppp_PPP',
+         'flag_type_MEDICAL',
+         'flag_type_SURGICAL',
+         'hospital_code_1001010001',
+         'hospital_code_1001220002',
+         'hospital_code_1001230002',
+         'hospital_code_1001280005',
+         'hospital_code_1001280007',
+         'hospital_code_1001330004',
+         'hospital_code_1001350004',
+         'hospital_code_1001380002',
+         'hospital_code_1015010017',
+         'hospital_code_1031010027',
+         'hospital_code_1032380023',
+         'hospital_code_1047010037',
+         'hospital_code_1068010044',
+         'hospital_code_1072010047',
+         'hospital_code_1081080007',
+         'hospital_code_1081310031',
+         'hospital_code_Others',
+         'hospitaltier_Clinic',
+         'hospitaltier_Government',
+         'hospitaltier_High',
+         'hospitaltier_Low',
+         'hospitaltier_Others',
+         'hsm_grouping_AI',
+         'hsm_grouping_CR',
+         'hsm_grouping_HB',
+         'hsm_grouping_HBP',
+         'hsm_grouping_HBPG',
+         'hsm_grouping_HBPGUDR',
+         'hsm_grouping_HBX',
+         'hsm_grouping_HS',
+         'hsm_grouping_HSJ',
+         'hsm_grouping_HSPG',
+         'hsm_grouping_HSUDR',
+         'hsm_grouping_HSX',
+         'hsm_grouping_PA_ME',
+         'hsm_grouping_UNCATEGORIZED',
+         'if_ind',
+         'illness_unique_C001',
+         'illness_unique_C017',
+         'illness_unique_C019',
+         'illness_unique_C020',
+         'illness_unique_C032',
+         'illness_unique_C100',
+         'illness_unique_D000',
+         'illness_unique_D033',
+         'illness_unique_D042',
+         'illness_unique_D120',
+         'illness_unique_H090',
+         'illness_unique_K101',
+         'illness_unique_K102',
+         'illness_unique_K106',
+         'illness_unique_K160',
+         'illness_unique_L015',
+         'illness_unique_Others',
+         'ind_acc',
+         'ins_province_code_1.0',
+         'ins_province_code_15.0',
+         'ins_province_code_16.0',
+         'ins_province_code_17.0',
+         'ins_province_code_20.0',
+         'ins_province_code_32.0',
+         'ins_province_code_47.0',
+         'ins_province_code_68.0',
+         'ins_province_code_72.0',
+         'ins_province_code_81.0',
+         'ins_province_code_Others',
+         'ins_region_code_1.0',
+         'ins_region_code_2.0',
+         'ins_region_code_3.0',
+         'ins_region_code_4.0',
+         'ins_region_code_5.0',
+         'ins_region_code_6.0',
+         'ins_region_code_7.0',
+         'ins_zip_cd_10120',
+         'ins_zip_cd_10150',
+         'ins_zip_cd_10160',
+         'ins_zip_cd_10220',
+         'ins_zip_cd_10230',
+         'ins_zip_cd_10240',
+         'ins_zip_cd_10250',
+         'ins_zip_cd_10310',
+         'ins_zip_cd_10510',
+         'ins_zip_cd_90110',
+         'ins_zip_cd_Others',
+         'lapse_ind',
+         'mode_premium_1.0',
+         'mode_premium_12.0',
+         'mode_premium_3.0',
+         'mode_premium_6.0',
+         'mult_diagnosis',
+         'nb_ind',
+         'occ_class_01',
+         'occ_class_02',
+         'occ_class_03',
+         'occ_class_04',
+         'occ_class_H1',
+         'occ_class_H2',
+         'occ_code_Others',
+         'occ_code_ก101010',
+         'occ_code_ก101110',
+         'occ_code_ค101010',
+         'occ_code_ง101010',
+         'occ_code_ง101112',
+         'occ_code_ท121010',
+         'occ_code_ป131210',
+         'occ_code_ศ101011',
+         'occ_code_ศ101110',
+         'occ_code_ส141010',
+         'ori_basic_sum_ass',
+         'plan_id_count',
+         'plan_short_name_HBN5',
+         'plan_short_name_HBPGN7',
+         'plan_short_name_HBPGUDN7',
+         'plan_short_name_HBXN7',
+         'plan_short_name_HSJRN7',
+         'plan_short_name_HSN5',
+         'plan_short_name_HSN6',
+         'plan_short_name_HSN7',
+         'plan_short_name_HSPGN7',
+         'plan_short_name_HSUDN7',
+         'plan_short_name_Others',
+         'planid_1151',
+         'planid_118',
+         'planid_119',
+         'planid_120',
+         'planid_174',
+         'planid_175',
+         'planid_176',
+         'planid_182',
+         'planid_183',
+         'planid_184',
+         'planid_185',
+         'planid_186',
+         'planid_188',
+         'planid_191',
+         'planid_192',
+         'planid_197',
+         'planid_Others',
+         'policy_no_count',
+         'prev_cvg_cstat_cd_1',
+         'prev_cvg_cstat_cd_1.0',
+         'prev_cvg_cstat_cd_B',
+         'prev_cvg_cstat_cd_K',
+         'procedure_1',
+         'procedure_2',
+         'procedure_desc_3_(10%/HN8) Excisional debridement of wound, infection, or burn',
+         'procedure_desc_3_(12.5%/-) Biopsy of bone marrow',
+         'procedure_desc_3_(25%/-) Esophagogastroduodenoscopy [EGD] with closed biopsy',
+         'procedure_desc_3_(25%/-) Other endoscopy of small intestine [EGD]',
+         'procedure_desc_3_(25%/HD8) Hemodialysis',
+         'procedure_desc_3_(25%/HN8) Colonoscopy',
+         'procedure_desc_3_(25%/HN8) Other gastroscopy',
+         'procedure_desc_3_(35%/HN8) Coronary arteriography using two catheters',
+         'procedure_desc_3_(50%/-) Phacoemulsification and aspiration of cataract',
+         'procedure_desc_3_(70%/HM8) Other and unspecified total abdominal hysterectomy',
+         'procedure_desc_3_Others',
+         'prst_amt_bill',
+         'rmbs_los',
+         'sex_code_F',
+         'sex_code_M',
+         'substandard_1_00',
+         'sum_assured_rb',
+         'treatmenttype_1.0',
+         'treatmenttype_11.0',
+         'treatmenttype_12.0',
+         'treatmenttype_13.0',
+         'treatmenttype_14.0',
+         'treatmenttype_2.0',
+         'treatmenttype_4.0',
+         'treatmenttype_5.0',
+         'treatmenttype_6.0',
+         'treatmenttype_7.0',
+         'type_claim_APPROVED',
+         'vip_ind_N',
+         'vip_ind_Y']
+        col_drop=list(set(data_out.columns).difference(set(col_ref)))
+        col_add=list(set(col_ref).difference(set(data_out.columns)))
+        
+        data_out=data_out.drop(col_drop,axis=1)
+        data_out[col_add]=0        
+        
+        self.df_aggregated=data_out
+    
+    def agg_process(self, dask_source=False): 
+        print('Deriving variables...')
+        self.variable_derivation()
+        
+        print('Pivoting benefits and eligible amount...')
+        self.Benefit_w_Eligibility()
+        
+        print('Aggregating variables...')
+        self.agg_max()
+        self.agg_count()
+        self.agg_dummy()
+        self.agg_sum_1()
+        self.agg_sum_2()
+        self.agg_mean()
+        self.agg_bin_dummy()
+        
+        print('Merging dataframes...')
+        self.merge_out()
+        
+        print('Complete.')
+        
+        
+        
+        
+        
+        
+        
