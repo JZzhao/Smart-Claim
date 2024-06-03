@@ -1,0 +1,1575 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # SHC Model Training
+
+# ## Modelling
+# 
+# **Semi-Supervised Learning through Self-Training**
+# 
+# - Utilize existing labels for initial baseline model training
+# - Use baseline model to predict on unlabeled data
+# - Combined predicted pseudo-labels and actual labels - and train on entire dataset
+# 
+# References: https://algorithmia.com/blog/semi-supervised-learning <br><br>
+# 
+# 
+#  
+# 
+# **Semi-Supervised Learning through Clustering to obtain labels then Supervised Learning**
+# 
+# - Utilize unsupervised learning (eg. K-Means Clustering) to identify 2 centroids (risky/not risky) for each issue category
+# - Using labeled data, identify the occurrences of risky and non-risky labels in each centroid - tag pseudo-label according to the centroids
+# - Combined pseudo-labels and actual labels - and train on entire dataset
+# 
+# References: https://www.nature.com/articles/s41598-018-24876-0 <br><br>
+# 
+#  
+# 
+# **Supervised Learning through Creation of synthetic data points using SMOTE**
+# 
+# - Based on existing labeled data, create synthetic data points of both 1 and 0 classes
+# - Using synthetically created data, perform supervised learning
+# 
+# References: https://towardsdatascience.com/smote-synthetic-data-augmentation-for-tabular-data-1ce28090debc 
+
+# ## Semi-Supervised Learning Through Self-Training
+
+# In[1]:
+
+
+# Data Pre-processing
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from sklearn.model_selection import train_test_split
+
+# Supervised Models
+from lightgbm import LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.metrics import Recall, Precision
+from tensorflow.keras import regularizers
+from tensorflow import keras
+from tensorflow_addons.metrics import F1Score
+
+from sklearn.model_selection import RandomizedSearchCV
+from skopt.space import Real, Integer, Categorical
+from skopt import BayesSearchCV
+from sklearn.utils import class_weight
+
+# Model Evaluation
+from sklearn.metrics import silhouette_score, accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score, roc_curve
+
+# Plotting libraries
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Others
+import numpy as np
+import math
+import warnings
+import pickle as pk
+import pandas as pd
+
+warnings.filterwarnings('ignore')
+
+
+# In[2]:
+
+
+# import tensorflow as tf
+# import random as python_random
+
+# # The below is necessary for starting Numpy generated random numbers
+# # in a well-defined initial state.
+# np.random.seed(10)
+
+# # The below is necessary for starting core Python generated random numbers
+# # in a well-defined state.
+# python_random.seed(10)
+
+# # The below set_seed() will make random number generation
+# # in the TensorFlow backend have a well-defined initial state.
+# # For further details, see:
+# # https://www.tensorflow.org/api_docs/python/tf/random/set_seed
+# tf.random.set_seed(10)
+
+# # Rest of code follows ...
+
+
+# In[4]:
+
+
+# Read aggregated data of labelled and unlabelled from aggregation pipeline
+
+df_model = pd.read_csv('data/modelling_data/cleansed_data_for_training.csv')
+df_model = df_model.reset_index(drop=True)
+
+
+# In[5]:
+
+
+thai_mapping = {"ก": "A",
+                "ค": "B",
+                "ง": "C",
+                "ท": "D", 
+                "ป": "E",
+                "ศ": "F",
+                "ส": "G"}
+
+def replace_thai_characters(col_name, thai_mapping):
+    for key in thai_mapping.keys():
+        if key in col_name:
+            return col_name.replace(key, thai_mapping[key])
+    return col_name
+        
+df_model.columns = [replace_thai_characters(col, thai_mapping) for col in df_model.columns]
+
+
+# In[6]:
+
+
+# # Remove non-ascii characters in column names
+# def remove_non_ascii_in_string(string_unicode):
+#     string_encode = string_unicode.encode("ascii", "ignore")
+#     string_decode = string_encode.decode()
+#     return string_decode
+
+# list_decoded_columns = [remove_non_ascii_in_string(i) for i in df_model.columns]
+# df_model.columns = list_decoded_columns
+
+
+# In[7]:
+
+
+# Drop columns that are non numerical (except for CLAIM_NO)
+object_columns = [i for i in list(df_model.dtypes[df_model.dtypes == 'object'].index) if i != 'claim_no']
+df_model.drop(columns=object_columns, inplace=True)
+
+
+# In[8]:
+
+
+for cat in ['UHA', 'UTSPD', 'SPEC', 'ELOS', 'ECHAR']:
+    df_model[f"{cat}_label"] = df_model[f"{cat}_Leakage_Actual"].apply(lambda x: (1 if x > 0 else 0) if not math.isnan(x) else np.nan)
+    
+non_feature_columns = ['claim_no', 'FI', 'UHA_Leakage_Actual', 'UTSPD_Leakage_Actual', 'SPEC_Leakage_Actual', 
+                       'ELOS_Leakage_Actual', 'ECHAR_Leakage_Actual',
+                      'UHA_label', 'UTSPD_label', 'SPEC_label', 
+                       'ELOS_label', 'ECHAR_label']
+
+feature_columns = [i for i in df_model.columns if i not in non_feature_columns]
+labelled_claim_no = list(df_model[df_model['SPEC_label'].notnull()]['claim_no'])
+
+
+# In[9]:
+
+
+# Variables
+label_cat = "UHA_label" # TO CHANGE ACCORDING TO WHICH CATEGORY MODEL WE ARE TRAINING FOR (e.g. Unnecessary Hospital Admission: "UHA_label", Unnecessary Treatment: "UTSPD_label", Suspicious Pre-existing Condition: "SPEC_label")
+label_columns = [label_cat]
+
+df_model_cat = df_model[['claim_no'] + label_columns + feature_columns].copy()
+claim_columns = df_model_cat['claim_no']
+
+# To pseudo label unlabelled claims with nearest 
+
+df_model_labelled = df_model_cat[df_model_cat['claim_no'].isin(labelled_claim_no)].copy()
+
+if label_cat == 'SPEC_label':
+    df_euc_distance_labels = pd.read_parquet("data/modelling_data/euc_dist_of_claims_from_positive_spec.parquet")
+    top_n_pseudo_neighbors = 5
+    df_unlabelled_euc_distance_labels = df_euc_distance_labels[df_euc_distance_labels['SPEC_label'].isnull()].copy()
+    list_of_pseudo_neighbors = list(df_unlabelled_euc_distance_labels.sort_values(by=['euc_dist_from_positive_spec'])['CLAIM_NO'][1:top_n_pseudo_neighbors+1])
+    df_model_spec_filtered = df_model[df_model['claim_no'].isin(list_of_pseudo_neighbors)][['claim_no'] + label_columns + feature_columns].copy()
+    df_model_labelled = pd.concat([df_model_labelled, df_model_spec_filtered])
+    df_model_labelled['SPEC_label'] = df_model_labelled['SPEC_label'].fillna(1.0)
+    
+
+
+# ### EDA
+
+# In[10]:
+
+
+# There are 212 columns with 1 unique value (features that can't differentiate) 
+
+df_model_labelled.nunique()[df_model_labelled.nunique() == 1]
+columns_with_1_unique_value = list(df_model_labelled.nunique()[df_model_labelled.nunique() == 1].index)
+
+# Filtering columns with non-differentiating values
+df_model_labelled_filtered = df_model_labelled[[i for i in df_model_labelled.columns if i not in columns_with_1_unique_value]]
+
+
+# In[11]:
+
+
+# Feature selection by absolute correlation before SMOTE (https://stats.stackexchange.com/questions/321970/imbalanced-data-smote-and-feature-selection)
+
+df_corr = pd.DataFrame(df_model_labelled_filtered.corr().iloc[:, 0]).reset_index().rename(columns={label_columns[0]: f"corr_{label_columns[0]}"}).sort_values(by=f"corr_{label_columns[0]}")
+df_corr[f"abs_corr_{label_columns[0]}"] = np.abs(df_corr[f"corr_{label_columns[0]}"])
+df_corr = df_corr.sort_values(by=[f"abs_corr_{label_columns[0]}", 'index'], ascending=False)
+df_corr = df_corr.iloc[1:, :]
+
+n_features_to_keep = 50
+feature_columns_to_keep = list(df_corr.sort_values(by=f"abs_corr_{label_columns[0]}", ascending=False)['index'][:n_features_to_keep])
+
+df_model_labelled_filtered = df_model_labelled_filtered[['claim_no'] + label_columns + feature_columns_to_keep]
+
+
+# ### Data Pre-processing
+
+# In[12]:
+
+
+# Minmax Scaler
+scaler_baseline = MinMaxScaler()
+df_model_labelled_filtered[feature_columns_to_keep] = scaler_baseline.fit_transform(df_model_labelled_filtered[feature_columns_to_keep])
+
+
+# #### SMOTE
+# - Paper: https://arxiv.org/pdf/1106.1813.pdf
+# - Methodology: The minority class is over-sampled
+# by taking each minority class sample and introducing synthetic examples along the line
+# segments joining any/all of the k minority class nearest neighbors
+
+# In[13]:
+
+
+# SMOTE
+oversample = SMOTE(k_neighbors=2, random_state=10)
+x, y = oversample.fit_resample(df_model_labelled_filtered[feature_columns_to_keep], df_model_labelled_filtered[label_columns])
+
+
+# ### Baseline Model Training using Random Forest
+
+# In[14]:
+
+
+model_hyperparam_baseline = {'rf': {'model': RandomForestClassifier(oob_score=True, random_state=10),
+                             'hyperparameters': {'n_estimators': [int(x) for x in np.linspace(start=10, stop=200, num=5)],
+                                                 'max_features': ['auto', 'sqrt'],
+                                                 'max_depth': [int(x) for x in np.linspace(start=10, stop=110, num=5)],
+                                                 'min_samples_split': [int(x) for x in np.linspace(start=2, stop=10, num=1)],
+                                                 'min_samples_leaf': [int(x) for x in np.linspace(start=1, stop=10, num=1)],
+                                                 'bootstrap': [True, False]}
+                                  }
+                           }
+
+
+# In[15]:
+
+
+def oob_scorer(estimator, X, y):
+    return estimator.oob_score_
+
+clf = RandomizedSearchCV(model_hyperparam_baseline['rf']['model'], model_hyperparam_baseline['rf']['hyperparameters'], scoring=oob_scorer, random_state=10)
+
+
+# In[16]:
+
+
+clf.fit(x, y)
+
+
+# In[17]:
+
+
+clf.best_params_
+
+
+# In[18]:
+
+
+clf.best_score_
+
+
+# ### Prediction on unlabelled data
+
+# In[19]:
+
+
+# Feature selection
+df_model_filtered = df_model[['claim_no'] + label_columns + feature_columns_to_keep]
+
+# Scaling
+df_model_filtered[feature_columns_to_keep] = scaler_baseline.transform(df_model_filtered[feature_columns_to_keep])
+
+x_unlabelled = df_model_filtered[feature_columns_to_keep]
+
+
+# In[20]:
+
+
+pred = clf.predict(x_unlabelled)
+
+
+# In[21]:
+
+
+df_model_cat[f"pred_{label_columns[0]}"] = pred
+
+
+# In[22]:
+
+
+df_model_cat[f"pred_{label_columns[0]}"].value_counts()
+
+
+# ### Pre-proc on semi-labelled data
+
+# In[23]:
+
+
+X = df_model_cat[feature_columns]
+Y = df_model_cat[f"pred_{label_columns[0]}"]
+
+
+# In[24]:
+
+
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.10, random_state=10)
+
+
+# In[ ]:
+
+
+# MinMaxScaler on whole data set
+scaler_semi = MinMaxScaler()
+
+df_model_cat.loc[X_train.index, feature_columns] = scaler_semi.fit_transform(df_model_cat.loc[X_train.index, feature_columns])
+df_model_cat.loc[X_test.index, feature_columns] = scaler_semi.transform(df_model_cat.loc[X_test.index, feature_columns])
+
+X_train = df_model_cat.loc[X_train.index, feature_columns].copy()
+X_test = df_model_cat.loc[X_test.index, feature_columns].copy()
+
+with open(f"models/{label_columns[0]}_scaler_semi.pk", "wb") as file:
+    pk.dump(scaler_semi, file)
+
+
+# In[ ]:
+
+
+df_model_test = df_model_cat[['claim_no', f"pred_{label_columns[0]}", label_columns[0]]].copy()
+df_model_test.loc[X_train.index, 'train_test'] = 'train'
+df_model_test['train_test'] = df_model_test['train_test'].fillna('test')
+df_model_test['train_test'].value_counts(dropna=False)
+
+df_model_test.to_parquet(f"models/{label_columns[0]}_train_test_mapping.parquet")
+
+
+# ### Modelling on semi-labelled data
+
+# In[ ]:
+
+
+def metrics_calculation(y_true, y_pred):
+    cf = confusion_matrix(y_true, y_pred)
+    tp = cf[1][1]
+    tn = cf[0][0]
+    fp = cf[0][1]
+    fn = cf[1][0]
+    
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    
+    print(f'''
+    TP: {tp}
+    TN: {tn}
+    FP: {fp}
+    FN: {fn}
+    Accuracy: {round(accuracy*100, 2)}%
+    Precision: {round(precision*100, 2)}%
+    Recall: {round(recall*100, 2)}%
+    F1-Score: {round(f1*100, 2)}%
+    ''')
+
+
+# In[ ]:
+
+
+class_weights = class_weight.compute_class_weight('balanced', np.unique(y_train), y_train)
+class_weights = {0: class_weights[0], 1: class_weights[1]}
+
+
+# #### Artificial Neural Network (ANN)
+
+# In[ ]:
+
+
+classifier = Sequential()
+
+# Adding the input layer and the first hidden layer
+classifier.add(Dense(units = int(X_train.shape[1]/2), kernel_initializer = 'uniform', activation = 'relu', input_dim = X_train.shape[1], kernel_regularizer=regularizers.l1_l2(l1=0.005, l2=0.005)))
+classifier.add(Dropout(rate = 0.1))
+
+# Adding the second hidden layer
+classifier.add(Dense(units = int(X_train.shape[1]/2), kernel_initializer = 'uniform', activation = 'relu'))
+classifier.add(Dropout(rate = 0.3))
+
+
+# Adding the third hidden layer
+classifier.add(Dense(units = int(X_train.shape[1]/3), kernel_initializer = 'uniform', activation = 'relu'))
+classifier.add(Dropout(rate = 0.5))
+
+# Adding the 4th hidden layer
+classifier.add(Dense(units = int(X_train.shape[1]/4), kernel_initializer = 'uniform', activation = 'relu'))
+classifier.add(Dropout(rate = 0.3))
+
+# Adding the 5th hidden layer
+classifier.add(Dense(units = int(X_train.shape[1]/5), kernel_initializer = 'uniform', activation = 'relu'))
+
+# Adding the output layer
+classifier.add(Dense(units = 1, kernel_initializer = 'uniform', activation = 'sigmoid'))
+
+print(classifier.summary())
+# Compiling the ANN
+classifier.compile(optimizer = 'adam', loss = 'binary_crossentropy', metrics = [Recall(), Precision()])
+
+history = classifier.fit(X_train, y_train, batch_size = len(X_train), epochs = 200, validation_split = 0.3, verbose = 0,class_weight = class_weights)
+
+
+# In[ ]:
+
+
+# classifier = Sequential()
+        
+# # Adding the input layer and the first hidden layer
+# classifier.add(Dense(units = int(X_train.shape[1]/2), kernel_initializer = 'uniform', activation = 'relu', input_dim = X_train.shape[1]))
+# classifier.add(Dropout(rate = 0.1))
+
+# # Adding the second hidden layer
+# classifier.add(Dense(units = int(X_train.shape[1]/2), kernel_initializer = 'uniform', activation = 'relu'))
+# classifier.add(Dropout(rate = 0.1))
+
+# # Adding the third hidden layer
+# classifier.add(Dense(units = int(X_train.shape[1]/4), kernel_initializer = 'uniform', activation = 'relu'))
+
+# # Adding the output layer
+# classifier.add(Dense(units = 1, kernel_initializer = 'uniform', activation = 'sigmoid'))
+
+# print(classifier.summary())
+# # Compiling the ANN
+# classifier.compile(optimizer = 'adam', loss = 'binary_crossentropy', metrics = [F1Score()])
+
+# # Fitting the ANN to the Training set
+# history = classifier.fit(X_train, y_train, batch_size = len(X_train), epochs = 20, validation_split = 0.25, verbose = 0, class_weight=class_weights)
+
+
+# In[ ]:
+
+
+classifier.save(f"models/{label_columns[0]}_ann")
+
+
+# In[ ]:
+
+
+y_pred = (classifier.predict(X_test) > 0.5).astype(int)
+y_test = y_test
+
+metrics_calculation(y_test, y_pred)
+
+
+# In[ ]:
+
+
+y_pred_labelled = (classifier.predict(df_model_cat[df_model_cat['claim_no'].isin(labelled_claim_no)][feature_columns]) > 0.5).astype(int)
+y_test_labelled = df_model_cat[df_model_cat['claim_no'].isin(labelled_claim_no)][label_columns]
+
+metrics_calculation(y_test_labelled, y_pred_labelled)
+
+
+# #### LightGBM
+
+# In[ ]:
+
+
+model_hyperparam_semi = {'rf': {'model': RandomForestClassifier(oob_score=True, random_state=10),
+                                'hyperparameters': {'n_estimators': [int(x) for x in np.linspace(start=10, stop=200, num=5)],
+                                                    'max_features': ['auto', 'sqrt'],
+                                                    'max_depth': [int(x) for x in np.linspace(start=10, stop=110, num=5)],
+                                                    'min_samples_split': [int(x) for x in np.linspace(start=2, stop=10, num=1)],
+                                                    'min_samples_leaf': [int(x) for x in np.linspace(start=1, stop=10, num=1)],
+                                                    'bootstrap': [True, False]
+                                                   }
+                              },
+                         
+                        'lightgbm': {'model': LGBMClassifier(random_state=10),
+                                     'hyperparameters': {'n_estimators': Integer(10, 200, 'uniform'),  
+                                                         'boosting_type': Categorical(['gbdt', 'dart']),
+                                                         'learning_rate': Real(0.05, 0.2, "log-uniform"),
+                                                         'max_depth': [-1],
+                                                         'num_leaves': Integer(10, 40, 'uniform'),
+                                                         'max_bin': [63]
+                                                        }
+                                    }
+                       }
+
+
+# In[ ]:
+
+
+# RandomizedSearchCV cannot use space hyperparameters, scikit-learn==0.23.2 to support BayesSearchCV
+
+lgbm_clf = BayesSearchCV(model_hyperparam_semi['lightgbm']['model'], model_hyperparam_semi['lightgbm']['hyperparameters'], n_iter=100, cv=5, scoring='f1', random_state=10, verbose=2)
+lgbm_clf.fit(np.array(X_train), np.array(y_train))
+
+
+# In[ ]:
+
+
+lgbm_clf.best_score_
+
+
+# In[ ]:
+
+
+lgbm_clf.best_params_
+
+
+# In[ ]:
+
+
+# Get threshold based on custom metric
+
+thresholds = np.arange(0, 1, 0.001)
+y_pred_positive_prob = lgbm_clf.predict_proba(X_test)[:, 1]
+
+def to_labels(y_pred_positive_prob, threshold):
+    return (y_pred_positive_prob >= threshold).astype(int)
+
+scores = [f1_score(y_test, to_labels(y_pred_positive_prob, t)) for t in thresholds]
+
+idx = np.argmax(scores)
+best_threshold = thresholds[idx]
+best_score = scores[idx]
+print(f"Best Threshold: {best_threshold}, with Score: {best_score}")
+
+
+# In[ ]:
+
+
+y_pred = (lgbm_clf.predict_proba(X_test)[:, 1] >= best_threshold).astype(int)
+y_test = y_test
+
+metrics_calculation(y_test, y_pred)
+
+
+# In[ ]:
+
+
+y_pred_labelled = (lgbm_clf.predict_proba(df_model_cat[df_model_cat['claim_no'].isin(labelled_claim_no)][feature_columns])[:, 1] > best_threshold).astype(int)
+y_test_labelled = df_model_cat[df_model_cat['claim_no'].isin(labelled_claim_no)][label_columns]
+
+metrics_calculation(y_test_labelled, y_pred_labelled)
+
+
+# In[ ]:
+
+
+with open(f"models/{label_columns[0]}_lgbm.pk", 'wb') as file:
+    pk.dump(lgbm_clf, file)
+
+
+# ## Testing on trained models
+# 
+# Testing for ANN - UHA (Best Threshold: 0.979)
+# ![image.png](attachment:08beb8f3-791f-4700-b97f-9e2d68f7d820.png)
+# 
+# -----------------------
+# 
+# Testing for LGBM - UHA (Best Threshold: 0.481)
+# ![image.png](attachment:3507ede7-6ff4-45a4-b93b-dd531925f4f5.png)
+# 
+# -----------------------
+# 
+# Testing for ANN - UTSPD (Best Threshold: 0.752)
+# ![image.png](attachment:a24e256e-5a5d-417e-a85d-bd48608f1b98.png)
+# 
+# -------------------------
+# 
+# Testing for LGBM - UTSPD (Best Threshold: 0.365)
+# ![image.png](attachment:c800871d-5d04-4d80-adc9-13953f388f37.png)
+# 
+# ------------------------
+# 
+# Testing for ANN - SPEC (Best Threshold: 0.734)
+# ![image.png](attachment:5a14668b-6d6c-45d8-aada-fea79cc61b10.png)
+# 
+# -----------------------
+# 
+# Testing for LGBM - SPEC (Best Threshold: 0.485)
+# ![image.png](attachment:1f235e7b-5e0e-4b08-bf45-aea2f7952b6d.png)
+# 
+# -----------------------
+# 
+# 
+
+# In[18]:
+
+
+def metrics_calculation(y_true, y_pred):
+    cf = confusion_matrix(y_true, y_pred)
+    tp = cf[1][1]
+    tn = cf[0][0]
+    fp = cf[0][1]
+    fn = cf[1][0]
+    
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    
+    print(f'''
+    TP: {tp}
+    TN: {tn}
+    FP: {fp}
+    FN: {fn}
+    Accuracy: {round(accuracy*100, 2)}%
+    Precision: {round(precision*100, 2)}%
+    Recall: {round(recall*100, 2)}%
+    F1-Score: {round(f1*100, 2)}%
+    ''')
+
+
+# In[19]:
+
+
+from tensorflow import keras
+
+# Load LGBM and ANN models for UHA and UTSPD
+def load_pickle_models(pickle_path):
+    with open(pickle_path, 'rb') as file:
+        model = pk.load(file)
+    return model
+
+ann_uha = keras.models.load_model('models/UHA_label_ann')
+lgbm_uha = load_pickle_models('models/UHA_label_lgbm.pk')
+
+ann_utspd = keras.models.load_model('models/UTSPD_label_ann')
+lgbm_utspd = load_pickle_models('models/UTSPD_label_lgbm.pk')
+
+ann_spec = keras.models.load_model('models/SPEC_label_ann')
+lgbm_spec = load_pickle_models('models/SPEC_label_lgbm.pk')
+
+# Load mapping
+mapping_uha = pd.read_parquet('models/UHA_label_train_test_mapping.parquet')
+mapping_utspd = pd.read_parquet('models/UTSPD_label_train_test_mapping.parquet')
+mapping_spec = pd.read_parquet('models/SPEC_label_train_test_mapping.parquet')
+
+# Load Scaler
+scaler_uha = load_pickle_models('models/UHA_label_scaler_semi.pk')
+scaler_utspd = load_pickle_models('models/UTSPD_label_scaler_semi.pk')
+scaler_spec = load_pickle_models('models/SPEC_label_scaler_semi.pk')
+
+
+test_dict = {'UHA': {'ann_model': ann_uha, 'lgbm_model': lgbm_uha, 'mapping': mapping_uha, 'scaler': scaler_uha},
+             'UTSPD': {'ann_model': ann_utspd, 'lgbm_model': lgbm_utspd, 'mapping': mapping_utspd, 'scaler': scaler_utspd},
+             'SPEC': {'ann_model': ann_spec, 'lgbm_model': lgbm_spec, 'mapping': mapping_spec, 'scaler': scaler_spec}}
+
+
+# In[20]:
+
+
+test_cat = 'SPEC'
+
+lgbm_model = test_dict[test_cat]['lgbm_model']
+ann_model = test_dict[test_cat]['ann_model']
+mapping = test_dict[test_cat]['mapping']
+scaler = test_dict[test_cat]['scaler']
+
+# Get df_model and scale
+
+df_model_test = df_model[['claim_no'] + feature_columns].copy()
+
+# Scaling
+df_model_test[feature_columns] = scaler.transform(df_model_test[feature_columns])
+
+# Testing for UHA
+
+df_model_test_cat = pd.merge(df_model_test, mapping[['claim_no', f"{test_cat}_label", f"pred_{test_cat}_label", 'train_test']], how='left', on='claim_no')
+df_model_test_cat.rename(columns={'train_test': f"{test_cat}_train_test"}, inplace=True)
+
+X_test = df_model_test_cat[df_model_test_cat[f"{test_cat}_train_test"] == 'test'][feature_columns]
+y_test = df_model_test_cat[df_model_test_cat[f"{test_cat}_train_test"] == 'test'][f"pred_{test_cat}_label"]
+y_test_labelled = df_model_test_cat[df_model_test_cat['claim_no'].isin(labelled_claim_no)][f"pred_{test_cat}_label"]
+
+
+# In[21]:
+
+
+# Get threshold based on custom metric
+
+def get_best_threshold(model, X_test, y_test, keras_or_pickle):
+
+    thresholds = np.arange(0, 1, 0.001)
+    
+    if keras_or_pickle == 'keras':
+        y_pred_positive_prob = model.predict(X_test)
+    elif keras_or_pickle == 'pickle':
+        y_pred_positive_prob = model.predict_proba(X_test)[:, 1]
+
+    def to_labels(y_pred_positive_prob, threshold):
+        return (y_pred_positive_prob > threshold).astype(int)
+
+    scores = [f1_score(y_test, to_labels(y_pred_positive_prob, t)) for t in thresholds]
+
+    idx = np.argmax(scores)
+    best_threshold = thresholds[idx]
+    best_score = scores[idx]
+    print(f"Best Threshold: {best_threshold}, with Score: {best_score}")
+    
+    return best_threshold, best_score
+
+
+# In[22]:
+
+
+best_ann_threshold, best_ann_score = get_best_threshold(ann_model, X_test, y_test, 'keras')
+
+
+# In[23]:
+
+
+y_pred_ann = (ann_model.predict(X_test) > best_ann_threshold).astype(int)
+y_pred_ann_labelled = (ann_model.predict(df_model_test_cat[df_model_test_cat['claim_no'].isin(labelled_claim_no)][feature_columns]) > best_ann_threshold).astype(int)
+
+print(f"{test_cat} - Artificial Neural Network\n")
+print("Test Data")
+metrics_calculation(y_test, y_pred_ann)
+
+print("Labelled Data")
+metrics_calculation(y_test_labelled, y_pred_ann_labelled)
+
+
+# In[24]:
+
+
+best_lgbm_threshold, best_lgbm_score = get_best_threshold(lgbm_model, X_test, y_test, 'pickle')
+
+
+# In[25]:
+
+
+y_pred_lgbm = (lgbm_model.predict_proba(X_test)[:, 1] >= best_lgbm_threshold).astype(int)
+y_pred_lgbm_labelled = (lgbm_model.predict_proba(df_model_test_cat[df_model_test_cat['claim_no'].isin(labelled_claim_no)][feature_columns])[:, 1] > best_lgbm_threshold).astype(int)
+
+print(f"{test_cat} - LGBM\n")
+print("Test Data")
+metrics_calculation(y_test, y_pred_lgbm)
+
+print("Labelled Data")
+metrics_calculation(y_test_labelled, y_pred_lgbm_labelled)
+
+
+# ### Model Explainability
+
+# In[26]:
+
+
+import shap
+shap.initjs()
+
+
+# In[ ]:
+
+
+df_labelled_for_explaination = df_model_test_cat[df_model_test_cat['claim_no'].isin(labelled_claim_no)][['claim_no'] + feature_columns].copy()
+df_labelled_for_explaination['prediction'] = y_pred_lgbm_labelled.copy()
+df_labelled_for_explaination['prediction_proba'] = lgbm_model.predict_proba(df_labelled_for_explaination[feature_columns])[:, 1]
+
+
+# ### General
+
+# In[ ]:
+
+
+# Saving output of force_plot as HTML: https://github.com/slundberg/shap/issues/3
+
+
+# ### Single Prediction Force Plot
+
+# In[ ]:
+
+
+test_no = 19
+
+test_sample = df_labelled_for_explaination.iloc[test_no-1:test_no, :]
+test_sample[['claim_no', 'prediction_proba']]
+
+
+# In[ ]:
+
+
+explainer = shap.TreeExplainer(lgbm_model.best_estimator_, data=shap.sample(X_test, 100), model_output='probability')
+
+
+# In[ ]:
+
+
+shap_values = explainer.shap_values(test_sample.iloc[:, 1:-2])
+
+
+# In[ ]:
+
+
+test_sample[['doctor_code_Others', 'doctor_code_8AAAA15AA8']]
+
+
+# In[ ]:
+
+
+shap.force_plot(explainer.expected_value, shap_values[0], features=X_test.columns, matplotlib=True)
+
+
+# ### Global Feature Importance
+
+# In[ ]:
+
+
+###  shap.plots.bar(shap_values)
+# Need to get SHAP values of whole data set, and plot global feature importance
+# Can consider non-absolute to signify direction
+
+
+# ## Others
+
+# In[ ]:
+
+
+def e2e_model_training(category):
+    
+    # Variables
+    feature_columns = [i for i in df_model.columns if i not in non_feature_columns]
+    label_cat = f"{category.upper()}_label"
+    label_columns = [label_cat]
+
+    df_model_cat = df_model[['claim_no'] + label_columns + feature_columns]
+    claim_columns = df_model_cat['claim_no']
+    labelled_claim_no = list(df_model_cat[df_model_cat[label_cat].notnull()]['claim_no'])
+
+    df_model_labelled = df_model_cat[df_model_cat['claim_no'].isin(labelled_claim_no)].copy()
+
+    # There are 212 columns with 1 unique value (features that can't differentiate) 
+    df_model_labelled.nunique()[df_model_labelled.nunique() == 1]
+    columns_with_1_unique_value = list(df_model_labelled.nunique()[df_model_labelled.nunique() == 1].index)
+
+    # Filtering columns with non-differentiating values
+    df_model_labelled_filtered = df_model_labelled[[i for i in df_model_labelled.columns if i not in columns_with_1_unique_value]]
+
+    # Feature selection by absolute correlation before SMOTE (https://stats.stackexchange.com/questions/321970/imbalanced-data-smote-and-feature-selection)
+
+    df_corr = pd.DataFrame(df_model_labelled_filtered.corr().iloc[:, 0]).reset_index().rename(columns={label_columns[0]: f"corr_{label_columns[0]}"}).sort_values(by=f"corr_{label_columns[0]}")
+    df_corr[f"abs_corr_{label_columns[0]}"] = np.abs(df_corr[f"corr_{label_columns[0]}"])
+    df_corr = df_corr.sort_values(by=f"abs_corr_{label_columns[0]}", ascending=False)
+    df_corr = df_corr.iloc[1:, :]
+
+    n_features_to_keep = 50
+    feature_columns_to_keep = list(df_corr.sort_values(by=f"abs_corr_{label_columns[0]}", ascending=False)['index'][:n_features_to_keep])
+
+    df_model_labelled_filtered = df_model_labelled_filtered[['claim_no'] + label_columns + feature_columns_to_keep]
+
+    # Minmax Scaler
+    scaler_baseline = MinMaxScaler()
+    df_model_labelled_filtered[feature_columns_to_keep] = scaler_baseline.fit_transform(df_model_labelled_filtered[feature_columns_to_keep])
+
+    # Upsampling of positive label for SPEC category
+
+    if label_cat == 'SPEC_label':
+        ros = RandomOverSampler(random_state=10)
+        X_resampled, y_resampled = ros.fit_resample(df_model_labelled_filtered[feature_columns_to_keep], df_model_labelled_filtered[label_columns])
+
+
+    # SMOTE
+    oversample = SMOTE(k_neighbors=2)
+    x, y = oversample.fit_resample(df_model_labelled_filtered[feature_columns_to_keep], df_model_labelled_filtered[label_columns])
+
+    model_hyperparam_baseline = {'rf': {'model': RandomForestClassifier(oob_score=True),
+                                 'hyperparameters': {'n_estimators': [int(x) for x in np.linspace(start=10, stop=200, num=5)],
+                                                     'max_features': ['auto', 'sqrt'],
+                                                     'max_depth': [int(x) for x in np.linspace(start=10, stop=110, num=5)],
+                                                     'min_samples_split': [int(x) for x in np.linspace(start=2, stop=10, num=1)],
+                                                     'min_samples_leaf': [int(x) for x in np.linspace(start=1, stop=10, num=1)],
+                                                     'bootstrap': [True, False]}
+                                      }
+                               }
+
+    def oob_scorer(estimator, X, y):
+        return estimator.oob_score_
+
+    clf = RandomizedSearchCV(model_hyperparam_baseline['rf']['model'], model_hyperparam_baseline['rf']['hyperparameters'], scoring=oob_scorer, random_state=10)
+
+    clf.fit(x, y)
+
+    # Feature selection
+    df_model_filtered = df_model[['claim_no'] + label_columns + feature_columns_to_keep]
+
+    # Scaling
+    df_model_filtered[feature_columns_to_keep] = scaler_baseline.transform(df_model_filtered[feature_columns_to_keep])
+
+    x_unlabelled = df_model_filtered[feature_columns_to_keep]
+
+    pred = clf.predict(x_unlabelled)
+
+    df_model_cat[f"pred_{label_columns[0]}"] = pred
+
+    # MinMaxScaler on whole data set
+    scaler_semi = MinMaxScaler()
+    df_model_cat[feature_columns] = scaler_semi.fit_transform(df_model_cat[feature_columns])
+
+    X = df_model_cat[feature_columns]
+    Y = df_model_cat[f"pred_{label_columns[0]}"]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.05, stratify=Y, random_state=10)
+
+    def metrics_calculation(y_true, y_pred):
+        cf = confusion_matrix(y_true, y_pred)
+        tp = cf[1][1]
+        tn = cf[0][0]
+        fp = cf[0][1]
+        fn = cf[1][0]
+
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred)
+        recall = recall_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred)
+
+        print(f'''
+        TP: {tp}
+        TN: {tn}
+        FP: {fp}
+        FN: {fn}
+        Accuracy: {round(accuracy*100, 2)}%
+        Precision: {round(precision*100, 2)}%
+        Recall: {round(recall*100, 2)}%
+        F1-Score: {round(f1*100, 2)}%
+        ''')
+
+    class_weights = class_weight.compute_class_weight('balanced', np.unique(y_train), y_train)
+    class_weights = {0: class_weights[0], 1: class_weights[1]}
+
+    classifier = Sequential()
+
+    # Adding the input layer and the first hidden layer
+    classifier.add(Dense(units = int(X_train.shape[1]/2), kernel_initializer = 'uniform', activation = 'relu', input_dim = X_train.shape[1],
+                         kernel_regularizer=regularizers.l1_l2(l1=0.005, l2=0.005)))
+    classifier.add(Dropout(rate = 0.1))
+
+    # Adding the second hidden layer
+    classifier.add(Dense(units = int(X_train.shape[1]/2), kernel_initializer = 'uniform', activation = 'relu'))
+    classifier.add(Dropout(rate = 0.3))
+
+
+    # Adding the third hidden layer
+    classifier.add(Dense(units = int(X_train.shape[1]/3), kernel_initializer = 'uniform', activation = 'relu'))
+    classifier.add(Dropout(rate = 0.5))
+
+    # Adding the 4th hidden layer
+    classifier.add(Dense(units = int(X_train.shape[1]/4), kernel_initializer = 'uniform', activation = 'relu'))
+    classifier.add(Dropout(rate = 0.3))
+
+    # Adding the 5th hidden layer
+    classifier.add(Dense(units = int(X_train.shape[1]/5), kernel_initializer = 'uniform', activation = 'relu'))
+
+    # Adding the output layer
+    classifier.add(Dense(units = 1, kernel_initializer = 'uniform', activation = 'sigmoid'))
+
+    #print(classifier.summary())
+    # Compiling the ANN
+    classifier.compile(optimizer = 'adam', loss = 'binary_crossentropy', metrics = ['accuracy'])
+
+    history = classifier.fit(X_train, Semi_train_Y, batch_size = len(X_train), epochs = 200, validation_split = 0.3, verbose = 0,class_weight = class_weights)
+    
+    # Save Keras
+    
+
+
+
+    #### LightGBM
+
+    model_hyperparam_semi = {'rf': {'model': RandomForestClassifier(oob_score=True, random_state=10),
+                                    'hyperparameters': {'n_estimators': [int(x) for x in np.linspace(start=10, stop=200, num=5)],
+                                                        'max_features': ['auto', 'sqrt'],
+                                                        'max_depth': [int(x) for x in np.linspace(start=10, stop=110, num=5)],
+                                                        'min_samples_split': [int(x) for x in np.linspace(start=2, stop=10, num=1)],
+                                                        'min_samples_leaf': [int(x) for x in np.linspace(start=1, stop=10, num=1)],
+                                                        'bootstrap': [True, False]
+                                                       }
+                                  },
+
+                            'lightgbm': {'model': LGBMClassifier(random_state=10),
+                                         'hyperparameters': {'n_estimators': Integer(10, 200, 'uniform'),  
+                                                             'boosting_type': Categorical(['gbdt', 'dart']),
+                                                             'learning_rate': Real(0.05, 0.2, "log-uniform"),
+                                                             'max_depth': [-1],
+                                                             'num_leaves': Integer(10, 40, 'uniform'),
+                                                             'max_bin': [63]
+                                                            }
+                                        }
+                           }
+
+    # RandomizedSearchCV cannot use space hyperparameters, scikit-learn==0.23.2 to support BayesSearchCV
+
+    lgbm_clf = BayesSearchCV(model_hyperparam_semi['lightgbm']['model'], model_hyperparam_semi['lightgbm']['hyperparameters'], n_iter=100, cv=5, scoring='f1', random_state=10, verbose=2)
+    lgbm_clf.fit(np.array(X_train), np.array(y_train))
+    
+    # Save LGBM
+
+
+# ## Semi-Supervised Learning through Clustering to obtain labels then Supervised Learning
+
+# In[ ]:
+
+
+# Data Pre-processing
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+
+# Unsupervised Models
+from sklearn.cluster import KMeans
+
+# Supervised Models
+from lightgbm import LGBMClassifier
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+
+# Model Evaluation
+from kneed import KneeLocator
+from sklearn.metrics import silhouette_score, accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+
+# Plotting libraries
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Others
+from scipy.spatial.distance import euclidean
+import numpy as np
+import math
+
+
+# In[ ]:
+
+
+# Read aggregated data of labelled and unlabelled from aggregation pipeline
+
+# df_model = pd.read_csv('data/Cleansed_data_full_agg.csv')
+df_model = pd.read_csv('data/Cleansed_data_full_updated_agg.csv')
+
+
+# In[ ]:
+
+
+# Drop columns that are non numerical (except for CLAIM_NO)
+object_columns = [i for i in list(df_model.dtypes[df_model.dtypes == 'object'].index) if i != 'CLAIM_NO']
+df_model.drop(columns=object_columns, inplace=True)
+
+
+# In[ ]:
+
+
+for cat in ['UHA', 'UTSPD', 'SPEC', 'ELOS', 'ECHAR']:
+    df_model[f"{cat}_label"] = df_model[f"{cat}_Leakage_Actual"].apply(lambda x: (1 if x > 0 else 0) if not math.isnan(x) else np.nan)
+    
+non_feature_columns = ['CLAIM_NO', 'FI', 'UHA_Leakage_Actual', 'UTSPD_Leakage_Actual', 'SPEC_Leakage_Actual', 
+                       'ELOS_Leakage_Actual', 'ECHAR_Leakage_Actual',
+                      'UHA_label', 'UTSPD_label', 'SPEC_label', 
+                       'ELOS_label', 'ECHAR_label']
+
+
+# In[ ]:
+
+
+feature_columns = [i for i in df_model.columns if i not in non_feature_columns]
+label_cat = "UHA_label"
+label_columns = [label_cat]
+
+x = df_model[feature_columns]
+y = df_model[label_columns]
+claim_columns = df_model['CLAIM_NO']
+labelled_claim_no = df_model[df_model[label_cat].notnull()]['CLAIM_NO']
+
+
+# ### Data Pre-processing
+
+# #### Scaling before PCA
+
+# In[ ]:
+
+
+# scaler = StandardScaler()
+scaler = MinMaxScaler()
+x_scaled = scaler.fit_transform(x)
+
+
+# In[ ]:
+
+
+df_model_scaled = pd.concat([pd.DataFrame(claim_columns, columns = ['CLAIM_NO']), 
+                             pd.DataFrame(x_scaled),
+                             pd.DataFrame(df_model[['UHA_label', 'UTSPD_label', 'SPEC_label']])], axis=1)
+
+
+# #### PCA to reduce dimensions to 2 components for clustering visualization
+
+# In[ ]:
+
+
+pca = PCA(n_components=0.95)
+x_scaled_pca = pca.fit_transform(x_scaled)
+
+
+# #### Euclidean distance measurement for closest claims to positive SPEC
+
+# In[ ]:
+
+
+claim_no_of_positive_spec = df_model_scaled[df_model_scaled['SPEC_label'] == 1]['CLAIM_NO'].iloc[0]
+
+
+# In[ ]:
+
+
+pca_columns = [f"component_{i}" for i in range(1, x_scaled_pca.shape[1] + 1)]
+
+df_model_pca =  pd.concat([pd.DataFrame(claim_columns, columns = ['CLAIM_NO']), 
+                             pd.DataFrame(x_scaled_pca, columns=pca_columns),
+                             pd.DataFrame(df_model[['UHA_label', 'UTSPD_label', 'SPEC_label']])], axis=1)
+
+df_model_pca['component_array'] = df_model_pca.apply(lambda row: np.array([row[component] for component in pca_columns]), axis=1)
+
+
+# In[ ]:
+
+
+positive_spec_components = df_model_pca[df_model_pca['CLAIM_NO'] == claim_no_of_positive_spec]['component_array'].iloc[0]
+
+
+def get_euclidean_distance(reference_point, other_point):
+    return euclidean(reference_point, other_point)
+
+df_model_pca['euc_dist_from_positive_spec'] = df_model_pca['component_array'].apply(lambda x: get_euclidean_distance(positive_spec_components, x))
+
+
+# In[ ]:
+
+
+df_model_pca_euc_dist = df_model_pca.sort_values(by=['euc_dist_from_positive_spec']).head(10000).copy()
+
+
+# In[ ]:
+
+
+df_model_pca_euc_dist.to_parquet('data/chunk_large/euc_dist_of_claims_from_positive_spec.parquet')
+
+
+# In[ ]:
+
+
+df_model_pca_euc_dist[['CLAIM_NO', 'component_array', 'SPEC_label', 'euc_dist_from_positive_spec']]
+
+
+# 
+# ### Unsupervised Learning to obtain pseudo-labels
+# 
+# - Inertia: Sum of squared distances of samples to their closest cluster center.
+# - Silhouette coefficient: silhouetter analysis is used to study sepration distance between resulting clusters. range from [-1,1], near +1 indicate that sample is far away from neighbouring clusters and vice-versa
+
+# In[ ]:
+
+
+#
+def fit_kmeans(x, n_clusters):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=10)
+    kmeans.fit(x)
+    sse = kmeans.inertia_
+    return kmeans, sse
+
+
+# #### Iteration through k-clusters
+
+# In[ ]:
+
+
+all_sse = []
+range_of_clusters = list(range(1, 21))
+for i in range_of_clusters:
+    _, sse = fit_kmeans(x_scaled_pca, i)
+    all_sse.append(sse)
+
+
+# In[ ]:
+
+
+plt.plot(range_of_clusters, all_sse)
+
+
+# In[ ]:
+
+
+kl = KneeLocator(range_of_clusters, all_sse, curve='convex', direction='decreasing')
+kl.elbow
+
+
+# #### Forcefully using k=2 clusters
+
+# In[ ]:
+
+
+kmeans_2, sse = fit_kmeans(x_scaled_pca, 2)
+
+
+# In[ ]:
+
+
+df_kmeans = pd.DataFrame(x_scaled_pca, columns=['component_1', 'component_2'])
+df_kmeans['CLAIM_NO'] = claim_columns
+df_kmeans['actual_label'] = y
+df_kmeans['predicted_cluster'] = kmeans_2.labels_
+
+df_kmeans_labelled = df_kmeans[df_kmeans['CLAIM_NO'].isin(labelled_claim_no)].copy()
+
+
+# In[ ]:
+
+
+plt.figure(figsize=(5,5))
+
+scatterplt = sns.scatterplot(x="component_1", y="component_2", s=50, data=df_kmeans, hue="predicted_cluster", style="actual_label")
+
+plt.show()
+
+
+# In[ ]:
+
+
+kmeans_2.cluster_centers_
+
+
+# In[ ]:
+
+
+kmeans_dict = df_kmeans.groupby(['predicted_cluster'])['actual_label'].value_counts().to_dict()
+kmeans_dict
+
+
+# In[ ]:
+
+
+predicted_actual_0_0 = kmeans_dict[(0,0.0)]
+predicted_actual_0_1 = kmeans_dict[(0,1.0)]
+predicted_actual_1_0 = kmeans_dict[(1,0.0)]
+predicted_actual_1_1 = kmeans_dict[(1,1.0)]
+
+
+# In[ ]:
+
+
+total_actual_1 = predicted_actual_0_1 + predicted_actual_1_1
+total_actual_0 = predicted_actual_1_0 + predicted_actual_0_0
+
+# Proportion of actual 1 in cluster 0
+proportion_of_actual_0_in_cluster_0 = predicted_actual_0_0 / total_actual_0
+proportion_of_actual_0_in_cluster_1 = 1 - proportion_of_actual_0_in_cluster_0
+
+
+proportion_of_actual_1_in_cluster_0 = predicted_actual_0_1 / total_actual_1
+proportion_of_actual_1_in_cluster_1 = 1 - proportion_of_actual_1_in_cluster_0
+
+
+# In[ ]:
+
+
+print(f"% of total actual 0s in cluster 0: {round(proportion_of_actual_0_in_cluster_0 * 100, 2)}%")
+print(f"% of total actual 1s in cluster 0: {round(proportion_of_actual_1_in_cluster_0 * 100, 2)}%")
+
+
+# In[ ]:
+
+
+cluster_0_mapping = 1 if proportion_of_actual_1_in_cluster_0 > proportion_of_actual_0_in_cluster_0 else 0
+cluster_1_mapping = 1 - cluster_0_mapping
+
+df_kmeans['derived_labels'] = df_kmeans['actual_label'].combine_first(df_kmeans['predicted_cluster'].map({0: cluster_0_mapping, 1: cluster_1_mapping})).astype(int)
+
+
+# In[ ]:
+
+
+df_model_scaled = pd.merge(df_model_scaled, df_kmeans[['CLAIM_NO', 'derived_labels']], how='left', on=['CLAIM_NO'])
+
+
+# ### Supervised learning using pseudo-labels
+
+# In[ ]:
+
+
+X = x_scaled
+Y = df_kmeans['derived_labels']
+
+
+# In[ ]:
+
+
+classifier = Sequential()
+        
+# Adding the input layer and the first hidden layer
+classifier.add(Dense(units = int(X.shape[1]/2), kernel_initializer = 'uniform', activation = 'relu', input_dim = X.shape[1]))
+classifier.add(Dropout(rate = 0.1))
+
+# Adding the second hidden layer
+classifier.add(Dense(units = int(X.shape[1]/2), kernel_initializer = 'uniform', activation = 'relu'))
+classifier.add(Dropout(rate = 0.1))
+
+# Adding the third hidden layer
+classifier.add(Dense(units = int(X.shape[1]/4), kernel_initializer = 'uniform', activation = 'relu'))
+
+# Adding the output layer
+classifier.add(Dense(units = 1, kernel_initializer = 'uniform', activation = 'sigmoid'))
+
+print(classifier.summary())
+# Compiling the ANN
+classifier.compile(optimizer = 'adam', loss = 'binary_crossentropy', metrics = ['accuracy'])
+
+# Fitting the ANN to the Training set
+history = classifier.fit(X, Y, batch_size = len(X), epochs = 20, validation_split = 0.25, verbose = 0)
+
+
+# #### Prediction on whole data
+
+# In[ ]:
+
+
+def metrics_calculation(y_true, y_pred):
+    cf = confusion_matrix(y_true, y_pred)
+    tp = cf[1][1]
+    tn = cf[0][0]
+    fp = cf[0][1]
+    fn = cf[1][0]
+    
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    
+    print(f'''
+    TP: {tp}
+    TN: {tn}
+    FP: {fp}
+    FN: {fn}
+    Accuracy: {round(accuracy*100, 2)}
+    Precision: {round(precision*100, 2)}
+    Recall: {round(recall*100, 2)}
+    F1-Score: {round(f1*100, 2)}
+    ''')
+
+
+# In[ ]:
+
+
+x = df_model_scaled[[i for i in df_model_scaled.columns if i not in ['CLAIM_NO', 'UHA_label', 'UTSPD_label', 'SPEC_label', 'derived_labels']]]
+y_true = df_model_scaled['derived_labels']
+
+
+# In[ ]:
+
+
+y_pred = (classifier.predict(x) > 0.5).astype(int)
+
+
+# In[ ]:
+
+
+metrics_calculation(y_true, y_pred)
+
+
+# #### Prediction on labelled data
+
+# In[ ]:
+
+
+df_model_scaled_labelled = df_model_scaled[df_model_scaled['CLAIM_NO'].isin(labelled_claim_no)]
+
+x_labelled = df_model_scaled_labelled[[i for i in df_model_scaled_labelled.columns if i not in ['CLAIM_NO', 'UHA_label', 'UTSPD_label', 'SPEC_label', 'derived_labels']]]
+y_true_labelled = df_model_scaled_labelled[label_columns]
+
+
+# In[ ]:
+
+
+y_pred_labelled = (classifier.predict(x_labelled) > 0.5).astype(int)
+
+
+# In[ ]:
+
+
+metrics_calculation(y_true_labelled, y_pred_labelled)
+
+
+# # Appendix
+
+# ## Check labelled data for possible imputation
+
+# In[ ]:
+
+
+filepath_labelled_parquet = "data/chunk_large/labelled_uncleaned.parquet"
+filepath_unlabelled_parquet = "data/chunk_large/unlabelled_cleaned.parquet"
+
+
+# In[ ]:
+
+
+df_labelled = pd.read_parquet(filepath_labelled_parquet)
+df_unlabelled = pd.read_parquet(filepath_unlabelled_parquet)
+df_labelled_unlabelled = pd.concat([df_labelled, df_unlabelled]).reset_index(drop=True)
+
+
+# In[ ]:
+
+
+list_of_labelled_claim_no = list(df_labelled['CLAIM_NO'].unique())
+
+# 36 out of 50 labelled claim nos have >= 1 missing policy information
+
+pd.options.display.max_columns = 50
+claim_no_with_missing_policy_info = list(df_labelled[df_labelled['NB_IND'].isnull()]['CLAIM_NO'].unique())
+
+# Out of 36 claim no, 34 do not have policy information at all (i.e others have at least 1 row of policy information)
+
+df_labelled_claims_with_missing_policy = df_labelled[df_labelled['CLAIM_NO'].isin(claim_no_with_missing_policy_info)].copy()
+df_labelled_claims_with_missing_policy['missing_policy'] = df_labelled_claims_with_missing_policy['NB_IND'].isnull()
+# df_labelled_claims_with_missing_policy.groupby('CLAIM_NO')['missing_policy'].mean()
+
+# Out of 36 claim no, 30 claim no have policy no. 1 - matched claim no do not have policy no.1
+df_labelled_claims_with_missing_policy[df_labelled_claims_with_missing_policy['POLICY_NO'] == '1']['CLAIM_NO'].nunique()
+
+
+# In[ ]:
+
+
+df_filtered = df_labelled_claims_with_missing_policy[['CLAIM_NO', 'POLICY_NO', 'COVERAGE_NO_RIDER_CD', 'CYCLE_DT','LAPSE_IND', 
+ 'NB_IND',
+ 'IF_IND',
+ 'BASIC_PLAN_ID',
+ 'PLAN_ID',
+ 'PLAN_SHORT_NAME',
+ 'EFFECTIVE_DATE',
+ 'DURATION_YR',
+ 'EARNED_SA',
+ 'SUM_ASSURED_RB',
+ 'CVG_ISSUE_AGE',
+ 'MODE_PREMIUM',
+ 'BASIC_SUM_ASS',
+ 'ORI_BASIC_SUM_ASS',
+ 'ANNUALIZE_PREMIUM',
+ 'E_PREMIUM_MTH',
+ 'E_POLICY_MTH',
+ 'CVG_CSTAT_CD',
+ 'PREV_CVG_CSTAT_CD',
+ 'INS_ZIP_CD',
+ 'INS_PROVINCE_NAME',
+ 'INS_REGION_NAME',
+ 'OCC_CLASS',
+ 'SUBSTANDARD_1',
+ 'AGENT_PROVINCE_NAME',
+ 'AGENT_REGION_NAME',
+ 'RMBS_LOS_ST',
+ 'CLAIM_CASE',
+ 'RMBS_AMT',
+ 'CLAIM_CASE_ST',
+ 'RMBS_AMT_ST',
+ 'EXP_CLM',
+ 'EXP_CLM_BE_2016',
+ 'EXP_BY_AGE',
+ 'VIP_IND',
+ 'BIRTH_DT',
+ 'AGE']].sort_values(by=['LAPSE_IND', 'CLAIM_NO', 'CYCLE_DT']).copy()
+
+
+# In[ ]:
+
+
+# Only Claim No 837517_A and policy no 1Z8C1A6 can utilize use the copy from same policy no method
+df_filtered[df_filtered.duplicated(subset=['CLAIM_NO', 'POLICY_NO'], keep=False)].head()
+
+df_filtered[df_filtered['CLAIM_NO'] == '837517_A']
+
+
+# In[ ]:
+
+
+# Drop duplicated policy rows, else taking mean will overweight on policies with multiple claims
+
+df_labelled_unlabelled_dropped = df_labelled_unlabelled.drop_duplicates(subset=['CLAIM_NO', 'POLICY_NO', 'COVERAGE_NO_RIDER_CD'])
+df_labelled_unlabelled_final = df_labelled_unlabelled.copy()
+
+
+# In[ ]:
+
+
+# For other claim no, identify the columns to do possible imputation and deduce the method
+
+mode_columns = ['LAPSE_IND', 'NB_IND', 'IF_IND', 'MODE_PREMIUM', 
+                'INS_ZIP_CD', 'INS_PROVINCE_NAME', 'INS_REGION_NAME', 
+                'OCC_CLASS', 'AGENT_PROVINCE_NAME', 'AGENT_REGION_NAME', 
+                'VIP_IND', 'BASIC_PLAN_ID', 'PLAN_ID', 'PLAN_SHORT_NAME','INS_REGION_CODE',
+                 'BIRTH_DT', 'OCC_CODE', 'PREV_CVG_CSTAT_CD', 'CVG_CSTAT_CD', 'AGENT_PROVINCE_CODE',
+                 'AGENT_REGION_CODE', 'CVG_ATTAIN_AGE', 'DURATION', 'INS_PROVINCE_CODE', 'SEX_CODE'] 
+
+median_columns = ['DURATION_YR', 'EARNED_SA', 'SUM_ASSURED_RB', 'CVG_ISSUE_AGE', 
+                  'BASIC_SUM_ASS', 'ORI_BASIC_SUM_ASS', 'ANNUALIZE_PREMIUM', 
+                  'E_PREMIUM_MTH', 'E_POLICY_MTH', 'RMBS_LOS_ST', 'CLAIM_CASE', 
+                  'RMBS_AMT', 'CLAIM_CASE_ST', 'RMBS_AMT_ST', 'EXP_CLM', 
+                  'EXP_CLM_BE_2016', 'EXP_BY_AGE', 'AGE']
+
+
+df_labelled_unlabelled_dropped[median_columns].isnull().mean()
+
+
+# In[ ]:
+
+
+# Imputation based on GroupBy on ['BUSINESSLINE', 'HSM_GROUPING'] - group by and impute based on types of policies
+for col in median_columns:
+    df_labelled_unlabelled_final[col] = df_labelled_unlabelled_final[col].fillna(df_labelled_unlabelled_dropped.groupby(['BUSINESSLINE', 'HSM_GROUPING'])[col].transform('median'))
+    
+# for col in mode_columns:
+#     df_labelled_unlabelled_dropped[col] = df_labelled_unlabelled.groupby(['BUSINESSLINE', 'HSM_GROUPING'])[col].apply(lambda grp: grp.fillna(grp.mode()))
+    
+# Since some groups are all NULL, need to impute those based on general population
+for col in median_columns:
+    df_labelled_unlabelled_final[col] = df_labelled_unlabelled_final[col].fillna(df_labelled_unlabelled_dropped[col].median())
+    
+for col in mode_columns:
+    df_labelled_unlabelled_final[col] = df_labelled_unlabelled_final[col].fillna(df_labelled_unlabelled_dropped[col].mode().iloc[0])
+
+
+# In[ ]:
+
+
+df_all_missing_columns = pd.DataFrame(df_labelled_unlabelled_final.isnull().mean()).reset_index().rename(columns={0: 'percentage_missing'})
+
+
+# In[ ]:
+
+
+# Missing claim rows are 'legitimate' missings (i.e diag desc etc.)
+df_all_missing_columns.sort_values(by='percentage_missing', ascending=False)
+
+
+# In[ ]:
+
+
+df_labelled_unlabelled.shape
+
+
+# In[ ]:
+
+
+# Export labelled data with imputted policy
+df_labelled_unlabelled_final[df_labelled_unlabelled_final['CLAIM_NO'].isin(list_of_labelled_claim_no)].to_parquet('data/chunk_large/labelled_uncleaned_updated.parquet')
+
