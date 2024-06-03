@@ -1,0 +1,257 @@
+## Importing libraries
+print("Importing libraries...")
+from azure.storage.blob import BlockBlobService
+import pandas as pd
+import os
+import sys
+import warnings
+import json
+import pickle as pk
+import numpy as np
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+
+warnings.filterwarnings('ignore')
+
+sys.path.append('deployment_pipelines')
+sys.path.append('deployment_preprocfiles')
+sys.path.append('deployment_models')
+
+## Importing pipelines
+
+import descriptive_pipeline
+import aggregation_pipeline
+import ml_pre_proc_pipeline
+import prediction_pipeline
+import sql_pipeline
+import output_pipeline
+
+## Importing attributes
+from model_features import scaling_features_order, uha_features, utspd_features, spec_features 
+
+deployment_data_folder = 'deployment_data'
+deployment_pipelines_folder = 'deployment_pipelines'
+
+# Initializing required parameters
+
+print("Initializing joining data...")
+print("\n")
+
+# Descriptive pipeline
+# df_policy_pipeline = pd.read_excel('deployment_data/policy_400_sample_descriptive_pipeline.xlsx')
+# df_policy_pipeline = pd.read_parquet('deployment_data/Masked_Policy_Data_filtered.parquet')
+# df_policy_pipeline = pd.read_parquet('deployment_data/policy_1000_sample.parquet')
+# df_policy_pipeline = pd.read_parquet('deployment_data/policy_10000_sample.parquet')
+
+
+df_policy_pipeline = pd.read_parquet('deployment_data/demo_policy_sample.parquet')
+
+df_web_scraped = pd.read_parquet('deployment_data/web_scraped_diagnosis.parquet')
+df_provider_information = pd.read_parquet('deployment_data/hospital_info_mapping.parquet')
+df_agent_info = pd.read_parquet('deployment_data/agent_info_mapping.parquet')
+
+with open('deployment_data/client_historical_claims.pk', 'rb') as file:
+    df_client_historical_claims = pk.load(file)
+    df_client_historical_claims.columns= ['client_id', 'claims_history']
+    
+    
+# Reading new JSON file from container
+
+account_name         = "apsdintgzesta01"
+account_key          = "byhdxs9L9HZxvacqXvcQRbwEWvIdwSFu9UCQxF2D974ukWbAaQ9L8317jfDzLgpgJnEewUMVXptAt8yPJW9vkw=="
+block_blob_service   = BlockBlobService(account_name=account_name, account_key=account_key)
+input_container_name = 'smart-health-claims-input'
+
+# Check if there are any JSON files - if yes, proceed with pipelines
+
+scan_message = 1
+while True:
+    list_of_files_in_container = [blob for blob in block_blob_service.list_blobs(input_container_name)]
+    
+    if scan_message == 1:
+        print("##########################")
+        print("Scanning for file uploads...")
+        scan_message = 0
+
+    if len(list_of_files_in_container) > 0:
+        # Delete old granular and aggregated files
+        # block_blob_service.delete_blob('smart-health-claims-output', 'saved_file_name')
+
+        print("New file uploaded...")
+        print("\n")
+        # converts json into df
+        input_file_name_in_container = list_of_files_in_container[0].name
+        saved_file_name = 'json_claims_input.json'
+        print("Getting blob to path...")
+        block_blob_service.get_blob_to_path(input_container_name, input_file_name_in_container, f"{deployment_data_folder}/{saved_file_name}")
+        df_claims_input = pd.read_json(f"{deployment_data_folder}/{saved_file_name}")
+
+        # deletes json in container
+        block_blob_service.delete_blob(input_container_name, saved_file_name)
+        
+        # Descriptive Pipeline
+        # input: claims, policy, webscraped
+        # output: df_claim_policy_webscraped_cleaned, df_descriptive_granular, df_descriptive_aggregated
+
+        print("Running descriptive pipeline...")
+
+        descriptive_pipe = descriptive_pipeline.descriptive_pipeline(df_claims_input,
+                                                                     df_policy_pipeline,
+                                                                     df_web_scraped,
+                                                                     df_provider_information,
+                                                                     df_agent_info,
+                                                                     df_client_historical_claims)
+
+        descriptive_pipe.e2e_cleaning_and_merging()
+
+        print("\n")
+        
+        # Aggregation Pipeline
+        # input: desc_pipeline.df_claim_policy_webscraped_cleaned
+        # output: df_aggregated
+
+        print("Running aggregation pipeline...")
+
+        aggregation_pipe = aggregation_pipeline.aggregation_pipeline(descriptive_pipe.df_claim_policy_webscraped_cleaned)
+
+        aggregation_pipe.agg_process()
+
+        print("\n")
+        
+        # ML Pre Proc Pipeline
+        # input: aggregation_pipeline.df_processed
+        # output: df_uha_features, df_utspd_features, df_spec_features
+
+        print("Running ML Pre-proc pipeline...")
+
+        ml_pre_proc_pipe = ml_pre_proc_pipeline.ml_pre_proc_pipeline(aggregation_pipe.df_aggregated, 
+                                                                     uha_features, 
+                                                                     utspd_features, 
+                                                                     spec_features,
+                                                                     scaling_features_order)
+
+
+        ml_pre_proc_pipe.e2e_process()
+
+        print("\n")
+        
+        # Prediction Pipeline
+        # input: ml_pre_proc_pipeline.df_uha_features, ml_pre_proc_pipeline.df_utspd_features, ml_pre_proc_pipeline.df_spec_features
+        # output: df_prediction
+
+        print("Running Prediction pipeline...")
+        
+        prediction_pipe = prediction_pipeline.prediction_pipeline(ml_pre_proc_pipe.df_uha_features,
+                                                                  ml_pre_proc_pipe.df_utspd_features,
+                                                                  ml_pre_proc_pipe.df_spec_features,
+                                                                  deployed_type='onnx')
+
+        prediction_pipe.e2e_process()
+
+        print("\n")
+        
+        
+        # Output Pipeline
+        # input: prediction_pipeline.df_prediction, descriptive_pipeline.df_descriptive_aggregated
+        # output: df_claim_queue_details, (df_justification_status to be inserted into table)
+
+        print("Running Output pipeline...")
+
+        output_pipe = output_pipeline.output_pipeline(descriptive_pipe.df_descriptive_aggregated,
+                                                     prediction_pipe.df_prediction,
+                                                     prediction_pipe.prediction_datetime)
+
+        output_pipe.e2e_output_pipeline()
+
+        print("\n")
+        
+        # Output files
+        df_aggregated = output_pipe.df_claim_queue_details.copy()
+        df_granular = descriptive_pipe.df_descriptive_granular.copy()
+        df_status = output_pipe.df_status_justification_sql_input.copy()
+        
+        # Write status row to SQL table
+        
+        sql_pipe = sql_pipeline.sql_pipeline()
+
+        print("Writing claim statuses to SQL table...")
+        print("\n")
+        
+        df_status.apply(lambda row: sql_pipe.insert_status_row_into_sql_table_if_claim_not_in_table('input_user_claim_status_justification',
+                                                                                                    row['claim_no'],
+                                                                                                    ['claim_no', 'user_id', 'status_justification_datetime', 'justification_text', 
+                                                                                                     'claim_status', 'issue_category_1_risk_validation', 'issue_category_2_risk_validation', 
+                                                                                                     'issue_category_3_risk_validation', 'issue_category_4_risk_validation',
+                                                                                                    'issue_category_5_risk_validation'],
+                                                                                                    row['claim_no'],
+                                                                                                    row['user_id'],
+                                                                                                    row['status_justification_datetime'],
+                                                                                                    row['justification_text'],
+                                                                                                    row['claim_status'],
+                                                                                                    row['uha_risk_validation'],
+                                                                                                    row['utspd_risk_validation'],
+                                                                                                    row['spec_risk_validation'],
+                                                                                                    row['los_risk_validation'],
+                                                                                                    row['hospital_service_charges_risk_validation']), axis=1)
+        
+        
+        
+        
+        # Transform to JSON files into container
+        # input: output_pipeline.df_claim_queue_details, descriptive_pipeline.df_descriptive_granular
+
+        print("Exporting aggregated and granular JSON...")
+        print("\n")
+
+        def process_df_for_json_output(df):
+            numerical_cols = list(df.dtypes[(df.dtypes == float) | (df.dtypes == int)].index)
+            other_cols = [i for i in df.columns if i not in numerical_cols]
+
+            df[other_cols] = df[other_cols].replace("nan", "NULL").fillna("NULL").astype(str)
+            df[numerical_cols] = df[numerical_cols].fillna(0)
+
+            #replace column names
+            df.columns = [i.replace(" ", "_").lower() for i in df.columns]
+
+            return df
+
+        df_aggregated = process_df_for_json_output(output_pipe.df_claim_queue_details.copy())
+        df_granular = process_df_for_json_output(descriptive_pipe.df_descriptive_granular.copy())
+
+                ##### SG for demo ####
+        def align_leakage_amount(row, eligibleamt_or_fi):
+            total_prediction = row['prediction_label_uha'] + row['prediction_label_utspd'] + row['prediction_label_spec']
+            if eligibleamt_or_fi == 'fi':
+                if total_prediction > 0:
+                    if row['prst_amt_bill_modified'] < row['eligibleamt']:
+                        return row['prst_amt_bill_modified']
+                    else:
+                        return row['eligibleamt']
+                return 0
+            else:
+                if row['prst_amt_bill_modified'] < row['eligibleamt']:
+                    return row['prst_amt_bill_modified']
+                else:
+                    return row['eligibleamt']
+
+        df_aggregated['potential_fi'] = df_aggregated.apply(lambda row: align_leakage_amount(row, 'fi'), axis=1)
+        df_aggregated['eligibleamt'] = df_aggregated.apply(lambda row: align_leakage_amount(row, 'eligibleamt'), axis=1)
+        ##### SG for demo ####
+
+        json_aggregated = json.dumps(df_aggregated.to_dict('records'))
+        json_granular = json.dumps(df_granular.to_dict('records'))
+
+        block_blob_service.create_blob_from_text('smart-health-claims-output', "json_aggregated.json", json_aggregated)
+        block_blob_service.create_blob_from_text('smart-health-claims-output', "json_granular.json", json_granular)
+
+        # block_blob_service.create_blob_from_text('smart-health-claims-data-processed-scored-json', "json_aggregated.json", json_aggregated)
+        # block_blob_service.create_blob_from_text('smart-health-claims-data-processed-scored-json', "json_granular.json", json_granular)
+
+        # Temp soln to give array of JSON
+        # json_claim_no = json.dumps({'claim_no_array': ",".join(list(df_aggregated['claim_no']))})
+        # block_blob_service.create_blob_from_text('smart-health-claims-data-processed-scored-json', "json_claim_array.json", json_claim_no)
+
+        
+        print("E2E Prediction completed.")
+        print("\n")
+        scan_message = 1
