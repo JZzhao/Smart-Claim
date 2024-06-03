@@ -1,0 +1,110 @@
+import re
+import pickle as pk
+import pandas as pd
+import numpy as np
+import os
+import tensorflow
+import json
+import onnx
+from onnx_tf.backend import prepare
+from datetime import datetime
+
+
+class prediction_pipeline():
+    
+    def __init__(self, df_uha_features, df_utspd_features, df_spec_features, deployed_type):
+        
+        print("Initiating attributes...")
+        # Inputs
+        self.df_uha_features = df_uha_features
+        self.df_utspd_features = df_utspd_features
+        self.df_spec_features = df_spec_features
+        self.deployed_type = deployed_type
+        
+        # Model files
+        model_folder = "deployment_models"
+        deployed_uha_file = f"{model_folder}/{[file for file in os.listdir(model_folder) if 'deployed_uha' in file][0]}"
+        deployed_utspd_file = f"{model_folder}/{[file for file in os.listdir(model_folder) if 'deployed_utspd' in file][0]}"
+        deployed_spec_file = f"{model_folder}/{[file for file in os.listdir(model_folder) if 'deployed_spec' in file][0]}"
+        
+        print("Loading models...")
+        
+        if deployed_type == 'keras':
+            self.deployed_uha_model = tensorflow.keras.models.load_model(deployed_uha_file)
+            self.deployed_utspd_model = tensorflow.keras.models.load_model(deployed_utspd_file)
+            self.deployed_spec_model = tensorflow.keras.models.load_model(deployed_spec_file)
+        elif deployed_type == 'onnx':
+            self.deployed_uha_model = onnx.load(deployed_uha_file)
+            self.deployed_utspd_model = onnx.load(deployed_utspd_file)
+            self.deployed_spec_model = onnx.load(deployed_spec_file)
+        
+        # Threshold values
+        with open(f"deployment_models/deployed_model_threshold.json", 'rb') as file:
+            dict_threshold = json.load(file)
+            self.uha_threshold = dict_threshold['uha_threshold']
+            self.utspd_threshold = dict_threshold['utspd_threshold']
+            self.spec_threshold = dict_threshold['spec_threshold']
+        
+        # Intermediate 
+        
+        self.df_prediction_uha = pd.DataFrame()
+        self.df_prediction_utspd = pd.DataFrame()
+        self.df_prediction_spec = pd.DataFrame()
+        
+        # Outputs
+        self.df_prediction = pd.DataFrame()
+        
+        # Variables
+        self.prediction_datetime = np.nan
+
+    def prediction(self, category):
+        
+        def prediction_func(df, model, threshold, category, deployed_type):
+            df_claim_no = df[['claim_no']]
+            x = df.drop(columns=['claim_no'])
+            
+            if deployed_type == 'keras':
+                prediction = model.predict(x)
+            elif deployed_type == 'onnx':
+                x = x.astype(np.float32)
+                tf_rep = prepare(model)
+                prediction = tf_rep.run(x)
+                prediction = np.squeeze(prediction)
+            
+            df_prediction = pd.DataFrame(prediction, columns=[f"prediction_probability_{category}"])
+            df_prediction = pd.concat([df_claim_no, df_prediction], axis=1)
+            df_prediction[f"prediction_label_{category}"] = df_prediction[f"prediction_probability_{category}"].apply(lambda x: 1 if x > threshold else 0)
+                
+            return df_prediction
+        
+        if category == 'uha':
+            self.df_prediction_uha = prediction_func(self.df_uha_features, self.deployed_uha_model, self.uha_threshold, category, self.deployed_type)
+        elif category == 'utspd':
+            self.df_prediction_utspd = prediction_func(self.df_utspd_features, self.deployed_utspd_model, self.utspd_threshold, category, self.deployed_type)
+        elif category == 'spec':
+            self.df_prediction_spec = prediction_func(self.df_spec_features, self.deployed_spec_model, self.spec_threshold, category, self.deployed_type)
+        
+    def combine_category_predictions(self):
+        df_prediction = pd.merge(self.df_prediction_uha, self.df_prediction_utspd, how='left', on='claim_no')
+        df_prediction = pd.merge(df_prediction, self.df_prediction_spec, how='left', on='claim_no')
+        
+        self.prediction_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df_prediction['prediction_datetime'] = self.prediction_datetime
+        
+        df_prediction = df_prediction[['claim_no', 'prediction_datetime',
+                                       'prediction_probability_uha', 'prediction_probability_utspd', 'prediction_probability_spec',
+                                       'prediction_label_uha', 'prediction_label_utspd', 'prediction_label_spec']]
+        
+        self.df_prediction = df_prediction
+        
+        
+    def e2e_process(self):
+        print("Predicting...")
+        self.prediction(category='uha')
+        self.prediction(category='utspd')
+        self.prediction(category='spec')
+        
+        print("Merging predictions...")
+        self.combine_category_predictions()
+        
+        print("Complete.")
