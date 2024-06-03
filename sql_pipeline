@@ -1,0 +1,61 @@
+import pyodbc
+
+class sql_pipeline():
+    
+    def __init__(self):
+        self.server = 'tcp:apspctipbjsql01.database.windows.net'
+        self.database = 'APSDINTGZESDB01'
+        self.username = 'INTGZESDBAdmin'
+        self.password = '+DK53j4nZ#zoE*z'
+        self.driver = '{ODBC Driver 17 for SQL Server}'  
+        
+    # General Methods
+    
+    def run_query_on_sql_database(self, query, *values):
+        with pyodbc.connect(f"DRIVER={self.driver};SERVER={self.server};PORT=1433;DATABASE={self.database};UID={self.username};PWD={self.password}") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, *values)
+    
+    def insert_row_into_sql_table(self, table, list_of_fields, *values):
+        list_of_values = list(values)
+
+        if len(list_of_fields) != len(list_of_values):
+            print("Number of fields does not match number of values.")
+            raise
+
+        values_placeholder = ['?'] * len(list_of_fields)
+        values_placeholder = ','.join(values_placeholder)
+        fields_string = ','.join(list_of_fields)
+
+        insert_query_template = f'''
+        INSERT INTO {self.database}.dbo.{table}
+        ({fields_string})
+        values
+        ({values_placeholder})
+        '''
+        
+        self.run_query_on_sql_database(insert_query_template, *values)
+                
+    
+    # Specific methods for stages in e2e pipeline
+                
+    def insert_status_row_into_sql_table_if_claim_not_in_table(self, table, claim_no, list_of_fields, *values):
+        list_of_values = list(values)
+
+        if len(list_of_fields) != len(list_of_values):
+            print("Number of fields does not match number of values.")
+            raise
+
+        values_placeholder = ['?'] * len(list_of_fields)
+        values_placeholder = ','.join(values_placeholder)
+        fields_string = ','.join(list_of_fields)
+        
+        insert_query_template = f'''
+        IF NOT EXISTS (SELECT claim_no FROM {self.database}.dbo.{table} WHERE claim_no = '{claim_no}')
+        INSERT INTO {self.database}.dbo.{table}
+        ({fields_string})
+        values
+        ({values_placeholder})
+        '''
+        
+        self.run_query_on_sql_database(insert_query_template, *values)
