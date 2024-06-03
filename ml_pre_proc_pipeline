@@ -1,0 +1,67 @@
+import re
+import pickle as pk
+import pandas as pd
+import numpy as np
+import os
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+class ml_pre_proc_pipeline():
+    
+    def __init__(self, df_aggregated, uha_features, utspd_features, spec_features, scaling_features_order):
+        # Mapping file 
+        self.scaling_features_order = scaling_features_order
+        
+        # Inputs
+        self.df_aggregated = df_aggregated[scaling_features_order]
+        
+        # Intermediate files
+        self.df_aggregated_scaled = pd.DataFrame()
+        
+        # Outputs
+        self.df_uha_features = pd.DataFrame()
+        self.df_utspd_features = pd.DataFrame()
+        self.df_spec_features = pd.DataFrame()
+        
+        # Features
+        self.uha_features = uha_features
+        self.utspd_features = utspd_features
+        self.spec_features = spec_features
+        
+    # Methods
+
+    def scaling(self):
+        # reads in scaler
+        scaler_folder = "deployment_preprocfiles/scalers"
+        
+        deployed_standardscaler_file = f"{scaler_folder}/{[file for file in os.listdir(scaler_folder) if 'deployed_standardscaler' in file][0]}"
+        with open(deployed_standardscaler_file, 'rb') as file:
+            deployed_standardscaler = pk.load(file)
+        
+        deployed_minmaxscaler_file = f"{scaler_folder}/{[file for file in os.listdir(scaler_folder) if 'deployed_minmaxscaler' in file][0]}"
+        with open(deployed_minmaxscaler_file, 'rb') as file:
+            deployed_minmaxscaler = pk.load(file)
+            
+        df_aggregated_scaled = self.df_aggregated.copy()
+        
+        df_aggregated_scaled[self.scaling_features_order[1:]] = deployed_standardscaler.transform(df_aggregated_scaled[self.scaling_features_order[1:]])
+        df_aggregated_scaled[self.scaling_features_order[1:]] = deployed_minmaxscaler.transform(df_aggregated_scaled[self.scaling_features_order[1:]])
+        
+#         df_aggregated_scaled = pd.concat([df_aggregated_scaled_claim_no, pd.DataFrame(df_aggregated_scaled_features, columns=columns_df_aggregated)], axis=1)
+        
+        self.df_aggregated_scaled = df_aggregated_scaled
+    
+    def feature_selection_and_split_separate_features_table(self):
+        
+        self.df_uha_features = self.df_aggregated_scaled[self.uha_features].copy()
+        self.df_utspd_features = self.df_aggregated_scaled[self.utspd_features].copy()
+        self.df_spec_features = self.df_aggregated_scaled[self.spec_features].copy()
+
+    def e2e_process(self):
+        print("Scaling data...")
+        self.scaling()
+        
+        print("Feature selection and spliting of features for respective category...")
+        self.feature_selection_and_split_separate_features_table()
+        
+        print("Complete.")
+        
